@@ -31,6 +31,7 @@ permissions:
 env:
   BACKEND_IMAGE: ghcr.io/${{ github.repository_owner }}/multica-backend
   WEB_IMAGE: ghcr.io/${{ github.repository_owner }}/multica-web
+  DEPLOY_PLATFORMS: linux/arm64
 
 jobs:
   build:
@@ -93,8 +94,10 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ env.DEPLOY_PLATFORMS }}
           push: true
+          cache-from: type=gha,scope=multica-backend
+          cache-to: type=gha,mode=max,scope=multica-backend
           tags: |
             ${{ env.BACKEND_IMAGE }}:latest
             ${{ env.BACKEND_IMAGE }}:sha-${{ github.sha }}
@@ -105,8 +108,10 @@ jobs:
         with:
           context: .
           file: ./Dockerfile.web
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ env.DEPLOY_PLATFORMS }}
           push: true
+          cache-from: type=gha,scope=multica-web
+          cache-to: type=gha,mode=max,scope=multica-web
           build-args: |
             REMOTE_API_URL=http://backend:8080
             NEXT_PUBLIC_WS_URL=wss://task.seongjun.kr/ws
