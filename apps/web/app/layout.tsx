@@ -5,6 +5,7 @@ import { Toaster } from "@multica/ui/components/ui/sonner";
 import { cn } from "@multica/ui/lib/utils";
 import { WebProviders } from "@/components/web-providers";
 import { LocaleSync } from "@/components/locale-sync";
+import { SentryInit } from "@/components/sentry-init";
 import "./globals.css";
 
 const geist = Geist({ subsets: ["latin"], variable: "--font-sans" });
@@ -50,6 +51,8 @@ export const metadata: Metadata = {
   },
 };
 
+export const dynamic = "force-dynamic";
+
 export default function RootLayout({
   children,
 }: {
@@ -62,6 +65,10 @@ export default function RootLayout({
       className={cn("antialiased font-sans h-full", geist.variable, geistMono.variable)}
     >
       <body className="h-full overflow-hidden">
+        <SentryInit
+          dsn={process.env.SENTRY_DSN}
+          environment={process.env.APP_ENV ?? process.env.NODE_ENV}
+        />
         <LocaleSync />
         <ThemeProvider>
           <WebProviders>

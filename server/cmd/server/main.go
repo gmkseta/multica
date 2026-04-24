@@ -14,11 +14,16 @@ import (
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/logger"
 	"github.com/multica-ai/multica/server/internal/realtime"
+	"github.com/multica-ai/multica/server/internal/telemetry"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
 func main() {
 	logger.Init()
+	sentryEnabled := telemetry.Init()
+	if sentryEnabled {
+		defer telemetry.Flush()
+	}
 
 	// Warn about missing configuration
 	if os.Getenv("JWT_SECRET") == "" {
@@ -42,12 +47,14 @@ func main() {
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, dbURL)
 	if err != nil {
+		telemetry.CaptureException(err)
 		slog.Error("unable to connect to database", "error", err)
 		os.Exit(1)
 	}
 	defer pool.Close()
 
 	if err := pool.Ping(ctx); err != nil {
+		telemetry.CaptureException(err)
 		slog.Error("unable to ping database", "error", err)
 		os.Exit(1)
 	}
@@ -81,6 +88,7 @@ func main() {
 	go func() {
 		slog.Info("server starting", "port", port)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			telemetry.CaptureException(err)
 			slog.Error("server error", "error", err)
 			os.Exit(1)
 		}
@@ -96,6 +104,7 @@ func main() {
 	defer cancel()
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
+		telemetry.CaptureException(err)
 		slog.Error("server forced to shutdown", "error", err)
 		os.Exit(1)
 	}

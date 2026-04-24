@@ -19,6 +19,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/realtime"
 	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/storage"
+	"github.com/multica-ai/multica/server/internal/telemetry"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
@@ -76,6 +77,7 @@ func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus) chi.Route
 
 	// Global middleware
 	r.Use(chimw.RequestID)
+	r.Use(telemetry.HTTPMiddleware())
 	r.Use(middleware.RequestLogger)
 	r.Use(chimw.Recoverer)
 	r.Use(middleware.ContentSecurityPolicy)
