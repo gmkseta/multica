@@ -1,48 +1,29 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { useDefaultLayout, usePanelRef } from "react-resizable-panels";
 import { AppLink } from "../../navigation";
 import { useNavigation } from "../../navigation";
 import {
+  Archive,
   Calendar,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
-  Link2,
+  CircleCheck,
   MoreHorizontal,
   PanelRight,
   Pin,
   PinOff,
   Plus,
-  Trash2,
-  UserMinus,
   Users,
 } from "lucide-react";
-import { toast } from "sonner";
+import { PageHeader } from "../../layout/page-header";
 import { Skeleton } from "@multica/ui/components/ui/skeleton";
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from "@multica/ui/components/ui/alert-dialog";
 import { Button } from "@multica/ui/components/ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuTrigger,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuSub,
-  DropdownMenuSubTrigger,
-  DropdownMenuSubContent,
-} from "@multica/ui/components/ui/dropdown-menu";
 import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from "@multica/ui/components/ui/resizable";
+import { Sheet, SheetContent } from "@multica/ui/components/ui/sheet";
+import { useIsMobile } from "@multica/ui/hooks/use-mobile";
 import { ContentEditor, type ContentEditorRef, TitleEditor, useFileDropZone, FileDropOverlay } from "../../editor";
 import { FileUploadButton } from "@multica/ui/components/common/file-upload-button";
 import {
@@ -55,21 +36,23 @@ import { Checkbox } from "@multica/ui/components/ui/checkbox";
 import { Command, CommandInput, CommandList, CommandEmpty, CommandGroup, CommandItem } from "@multica/ui/components/ui/command";
 import { AvatarGroup, AvatarGroupCount } from "@multica/ui/components/ui/avatar";
 import { ActorAvatar } from "../../common/actor-avatar";
-import type { UpdateIssueRequest, IssueStatus, IssuePriority, TimelineEntry } from "@multica/core/types";
-import { ALL_STATUSES, STATUS_CONFIG, PRIORITY_ORDER, PRIORITY_CONFIG } from "@multica/core/issues/config";
-import { StatusIcon, PriorityIcon, StatusPicker, PriorityPicker, DueDatePicker, AssigneePicker, canAssignAgent } from ".";
+import { PropRow } from "../../common/prop-row";
+import type { IssueStatus, IssuePriority, TimelineEntry } from "@multica/core/types";
+import { STATUS_CONFIG, PRIORITY_CONFIG } from "@multica/core/issues/config";
+import { StatusIcon, PriorityIcon, StatusPicker, PriorityPicker, DueDatePicker, AssigneePicker, LabelPicker } from ".";
+import { IssueActionsDropdown, useIssueActions } from "../actions";
 import { ProjectPicker } from "../../projects/components/project-picker";
 import { CommentCard } from "./comment-card";
 import { CommentInput } from "./comment-input";
-import { AgentLiveCard, TaskRunHistory } from "./agent-live-card";
+import { AgentLiveCard } from "./agent-live-card";
+import { ExecutionLogSection } from "./execution-log-section";
 import { useQuery } from "@tanstack/react-query";
 import { useAuthStore } from "@multica/core/auth";
-import { useWorkspaceStore } from "@multica/core/workspace";
+import { useCurrentWorkspace, useWorkspacePaths } from "@multica/core/paths";
 import { useActorName } from "@multica/core/workspace/hooks";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { issueListOptions, issueDetailOptions, childIssuesOptions, issueUsageOptions } from "@multica/core/issues/queries";
 import { memberListOptions, agentListOptions } from "@multica/core/workspace/queries";
-import { useUpdateIssue, useDeleteIssue } from "@multica/core/issues/mutations";
 import { useRecentIssuesStore } from "@multica/core/issues/stores";
 import { useIssueTimeline } from "../hooks/use-issue-timeline";
 import { useIssueReactions } from "../hooks/use-issue-reactions";
@@ -80,8 +63,6 @@ import { api } from "@multica/core/api";
 import { useModalStore } from "@multica/core/modals";
 import { timeAgo } from "@multica/core/utils";
 import { cn } from "@multica/ui/lib/utils";
-import { pinListOptions } from "@multica/core/pins";
-import { useCreatePin, useDeletePin } from "@multica/core/pins";
 
 import { ProgressRing } from "./progress-ring";
 
@@ -153,34 +134,14 @@ function formatTokenCount(n: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// Property row
-// ---------------------------------------------------------------------------
-
-function PropRow({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="flex min-h-8 items-center gap-2 rounded-md px-2 -mx-2 hover:bg-accent/50 transition-colors">
-      <span className="w-16 shrink-0 text-xs text-muted-foreground">{label}</span>
-      <div className="flex min-w-0 flex-1 items-center gap-1.5 text-xs truncate">
-        {children}
-      </div>
-    </div>
-  );
-}
-
-
-// ---------------------------------------------------------------------------
 // Props
 // ---------------------------------------------------------------------------
 
 interface IssueDetailProps {
   issueId: string;
   onDelete?: () => void;
+  /** Called after the issue is marked as done via the toolbar button. */
+  onDone?: () => void;
   defaultSidebarOpen?: boolean;
   layoutId?: string;
   /** When set, the issue detail will auto-scroll to this comment and briefly highlight it. */
@@ -191,33 +152,45 @@ interface IssueDetailProps {
 // IssueDetail
 // ---------------------------------------------------------------------------
 
-export function IssueDetail({ issueId, onDelete, defaultSidebarOpen = true, layoutId = "multica_issue_detail_layout", highlightCommentId }: IssueDetailProps) {
+export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = true, layoutId = "multica_issue_detail_layout", highlightCommentId }: IssueDetailProps) {
   const id = issueId;
   const router = useNavigation();
   const user = useAuthStore((s) => s.user);
-  const userId = useAuthStore((s) => s.user?.id);
-  const workspace = useWorkspaceStore((s) => s.workspace);
+  const workspace = useCurrentWorkspace();
+  const paths = useWorkspacePaths();
 
   // Issue navigation — read from TQ list cache
   const wsId = useWorkspaceId();
   const { data: members = [] } = useQuery(memberListOptions(wsId));
   const { data: agents = [] } = useQuery(agentListOptions(wsId));
-  const currentMemberRole = members.find((m) => m.user_id === user?.id)?.role;
+  // Workspace owners and admins moderate any comment authored by anyone
+  // (mirrors backend `comment.go:507-512`). Computed here so per-comment
+  // rendering doesn't have to re-derive it for every row.
+  const currentUserRole =
+    members.find((m) => m.user_id === user?.id)?.role ?? null;
+  const canModerateComments =
+    currentUserRole === "owner" || currentUserRole === "admin";
   const { data: allIssues = [] } = useQuery(issueListOptions(wsId));
-  const currentIndex = allIssues.findIndex((i) => i.id === id);
-  const prevIssue = currentIndex > 0 ? allIssues[currentIndex - 1] : null;
-  const nextIssue = currentIndex < allIssues.length - 1 ? allIssues[currentIndex + 1] : null;
   const { getActorName } = useActorName();
   const { uploadWithToast } = useFileUpload(api);
   const { defaultLayout, onLayoutChanged } = useDefaultLayout({
     id: layoutId,
   });
   const sidebarRef = usePanelRef();
-  const [sidebarOpen, setSidebarOpen] = useState(defaultSidebarOpen);
-  const [deleting, setDeleting] = useState(false);
-  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
+  const isMobile = useIsMobile();
+  const [desktopSidebarOpen, setDesktopSidebarOpen] = useState(defaultSidebarOpen);
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+
+  useEffect(() => {
+    if (isMobile) {
+      setMobileSidebarOpen(false);
+    }
+  }, [isMobile]);
+  const sidebarOpen = isMobile ? mobileSidebarOpen : desktopSidebarOpen;
   const [propertiesOpen, setPropertiesOpen] = useState(true);
   const [detailsOpen, setDetailsOpen] = useState(true);
+  const [parentIssueOpen, setParentIssueOpen] = useState(true);
+  const [tokenUsageOpen, setTokenUsageOpen] = useState(true);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const [highlightedId, setHighlightedId] = useState<string | null>(null);
   const didHighlightRef = useRef<string | null>(null);
@@ -237,41 +210,104 @@ export function IssueDetail({ issueId, onDelete, defaultSidebarOpen = true, layo
   const recordVisit = useRecentIssuesStore((s) => s.recordVisit);
   useEffect(() => {
     if (issue) {
-      recordVisit({
-        id: issue.id,
-        identifier: issue.identifier,
-        title: issue.title,
-        status: issue.status,
-      });
+      recordVisit(issue.id);
     }
   }, [issue?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Fire `onDelete` once when the issue transitions from loaded to missing.
+  // Delete goes through a shell-level modal, so the caller (e.g. inbox) can't
+  // be notified directly — instead, the detail page observes its own cache
+  // clearing and runs the callback. We navigate via `onDeletedNavigateTo` on
+  // the actions menu when no callback is supplied (standalone routes).
+  const hadIssueRef = useRef(false);
+  const firedDeleteCallbackRef = useRef(false);
+  useEffect(() => {
+    if (issue) {
+      hadIssueRef.current = true;
+      firedDeleteCallbackRef.current = false;
+      return;
+    }
+    if (
+      hadIssueRef.current &&
+      !issueLoading &&
+      !firedDeleteCallbackRef.current &&
+      onDelete
+    ) {
+      firedDeleteCallbackRef.current = true;
+      onDelete();
+    }
+  }, [issue, issueLoading, onDelete]);
+
   // Custom hooks — encapsulate timeline, reactions, subscribers
   const {
-    timeline, loading: timelineLoading, submitComment, submitReply,
+    timeline, submitComment, submitReply,
     editComment, deleteComment, toggleReaction: handleToggleReaction,
   } = useIssueTimeline(id, user?.id);
 
+  // Memoized timeline grouping. The same Map / groups references are reused
+  // across re-renders that don't change `timeline`, so React.memo on
+  // CommentCard can skip re-rendering when the only thing that moved was
+  // unrelated parent state (e.g. composer draft, sidebar toggle).
+  const timelineView = useMemo(() => {
+    const topLevel = timeline.filter((e) => e.type === "activity" || !e.parent_id);
+    const repliesByParent = new Map<string, TimelineEntry[]>();
+    for (const e of timeline) {
+      if (e.type === "comment" && e.parent_id) {
+        const list = repliesByParent.get(e.parent_id) ?? [];
+        list.push(e);
+        repliesByParent.set(e.parent_id, list);
+      }
+    }
+
+    // Coalesce: same actor + same action within 2 min → keep last only
+    const COALESCE_MS = 2 * 60 * 1000;
+    const coalesced: TimelineEntry[] = [];
+    for (const entry of topLevel) {
+      if (entry.type === "activity") {
+        const prev = coalesced[coalesced.length - 1];
+        if (
+          prev?.type === "activity" &&
+          prev.action === entry.action &&
+          prev.actor_type === entry.actor_type &&
+          prev.actor_id === entry.actor_id &&
+          Math.abs(new Date(entry.created_at).getTime() - new Date(prev.created_at).getTime()) <= COALESCE_MS
+        ) {
+          coalesced[coalesced.length - 1] = entry;
+          continue;
+        }
+      }
+      coalesced.push(entry);
+    }
+
+    // Group consecutive activities together so the connector line works
+    const groups: { type: "activities" | "comment"; entries: TimelineEntry[] }[] = [];
+    for (const entry of coalesced) {
+      if (entry.type === "activity") {
+        const last = groups[groups.length - 1];
+        if (last?.type === "activities") {
+          last.entries.push(entry);
+        } else {
+          groups.push({ type: "activities", entries: [entry] });
+        }
+      } else {
+        groups.push({ type: "comment", entries: [entry] });
+      }
+    }
+
+    return { repliesByParent, groups };
+  }, [timeline]);
+
   const {
-    reactions: issueReactions, loading: reactionsLoading,
+    reactions: issueReactions,
     toggleReaction: handleToggleIssueReaction,
   } = useIssueReactions(id, user?.id);
 
   const {
-    subscribers, loading: subscribersLoading, isSubscribed, toggleSubscribe: handleToggleSubscribe, toggleSubscriber,
+    subscribers, isSubscribed, toggleSubscribe: handleToggleSubscribe, toggleSubscriber,
   } = useIssueSubscribers(id, user?.id);
 
   // Token usage
   const { data: usage } = useQuery(issueUsageOptions(id));
-
-  // Pinned state
-  const { data: pinnedItems = [] } = useQuery({
-    ...pinListOptions(wsId, userId ?? ""),
-    enabled: !!userId,
-  });
-  const isPinned = pinnedItems.some((p) => p.item_type === "issue" && p.item_id === id);
-  const createPin = useCreatePin();
-  const deletePin = useDeletePin();
 
   // Sub-issue queries
   const parentIssueId = issue?.parent_issue_id;
@@ -302,26 +338,13 @@ export function IssueDetail({ issueId, onDelete, defaultSidebarOpen = true, layo
     if (el) {
       didHighlightRef.current = highlightCommentId;
       requestAnimationFrame(() => {
-        el.scrollIntoView({ behavior: "smooth", block: "center" });
+        el.scrollIntoView({ behavior: "instant", block: "center" });
         setHighlightedId(highlightCommentId);
         const timer = setTimeout(() => setHighlightedId(null), 2000);
         return () => clearTimeout(timer);
       });
     }
   }, [highlightCommentId, timeline.length]);
-
-  // Issue field updates via TQ mutation (optimistic update + rollback in mutation hook)
-  const updateIssueMutation = useUpdateIssue();
-  const handleUpdateField = useCallback(
-    (updates: Partial<UpdateIssueRequest>) => {
-      if (!issue) return;
-      updateIssueMutation.mutate(
-        { id, ...updates },
-        { onError: () => toast.error("Failed to update issue") },
-      );
-    },
-    [issue, id, updateIssueMutation],
-  );
 
   const descEditorRef = useRef<ContentEditorRef>(null);
   const { isDragOver: descDragOver, dropZoneProps: descDropZoneProps } = useFileDropZone({
@@ -334,62 +357,64 @@ export function IssueDetail({ issueId, onDelete, defaultSidebarOpen = true, layo
     [uploadWithToast],
   );
 
-  const deleteIssueMutation = useDeleteIssue();
-  const handleDelete = async () => {
-    setDeleting(true);
-    try {
-      await deleteIssueMutation.mutateAsync(issue!.id);
-      toast.success("Issue deleted");
-      if (onDelete) onDelete();
-      else router.push("/issues");
-    } catch {
-      toast.error("Failed to delete issue");
-      setDeleting(false);
+  // Shared issue actions (mutations, pin, copy-link, modal dispatch, etc.).
+  // Called before the `if (!issue)` early return so hook order stays stable.
+  const actions = useIssueActions(issue);
+  const handleUpdateField = actions.updateField;
+
+  const handleToggleSidebar = useCallback(() => {
+    if (isMobile) {
+      setMobileSidebarOpen((open) => !open);
+      return;
     }
-  };
+
+    const panel = sidebarRef.current;
+    if (!panel) return;
+    if (panel.isCollapsed()) panel.expand();
+    else panel.collapse();
+  }, [isMobile, sidebarRef]);
 
   if (loading) {
     return (
       <div className="flex flex-1 min-h-0 flex-col">
-        {/* Header skeleton */}
         <div className="flex h-12 shrink-0 items-center gap-2 border-b px-4">
           <Skeleton className="h-4 w-16" />
           <Skeleton className="h-4 w-4" />
           <Skeleton className="h-4 w-24" />
         </div>
         <div className="flex flex-1 min-h-0">
-          {/* Content skeleton */}
-          <div className="flex-1 p-8 space-y-6">
-            <Skeleton className="h-8 w-3/4" />
-            <div className="space-y-2">
-              <Skeleton className="h-4 w-full" />
-              <Skeleton className="h-4 w-5/6" />
-              <Skeleton className="h-4 w-2/3" />
-            </div>
-            <Skeleton className="h-px w-full" />
-            <div className="space-y-3">
-              <Skeleton className="h-4 w-20" />
-              <div className="flex items-start gap-3">
-                <Skeleton className="h-8 w-8 rounded-full" />
-                <div className="flex-1 space-y-2">
-                  <Skeleton className="h-4 w-32" />
-                  <Skeleton className="h-16 w-full rounded-lg" />
+          <div className="flex-1 overflow-y-auto">
+            <div className="mx-auto w-full max-w-4xl px-8 py-8 space-y-6">
+              <Skeleton className="h-8 w-3/4" />
+              <div className="space-y-2">
+                <Skeleton className="h-4 w-full" />
+                <Skeleton className="h-4 w-5/6" />
+                <Skeleton className="h-4 w-2/3" />
+              </div>
+              <Skeleton className="h-px w-full" />
+              <div className="space-y-3">
+                <Skeleton className="h-4 w-20" />
+                <div className="flex items-start gap-3">
+                  <Skeleton className="h-8 w-8 shrink-0 rounded-full" />
+                  <div className="flex-1 space-y-2">
+                    <Skeleton className="h-4 w-32" />
+                    <Skeleton className="h-16 w-full rounded-lg" />
+                  </div>
                 </div>
               </div>
             </div>
           </div>
-          {/* Sidebar skeleton */}
-          <div className="w-64 border-l p-4 space-y-4">
+          <div className="hidden md:block w-80 border-l p-4 space-y-5">
             {Array.from({ length: 4 }).map((_, i) => (
-              <div key={i} className="flex items-center justify-between">
-                <Skeleton className="h-3 w-16" />
+              <div key={i} className="flex items-center gap-2">
+                <Skeleton className="h-3 w-16 shrink-0" />
                 <Skeleton className="h-5 w-24" />
               </div>
             ))}
             <Skeleton className="h-px w-full" />
             {Array.from({ length: 3 }).map((_, i) => (
-              <div key={i} className="flex items-center justify-between">
-                <Skeleton className="h-3 w-16" />
+              <div key={i} className="flex items-center gap-2">
+                <Skeleton className="h-3 w-16 shrink-0" />
                 <Skeleton className="h-4 w-28" />
               </div>
             ))}
@@ -404,7 +429,7 @@ export function IssueDetail({ issueId, onDelete, defaultSidebarOpen = true, layo
       <div className="flex flex-1 min-h-0 flex-col items-center justify-center gap-3 text-sm text-muted-foreground">
         <p>This issue does not exist or has been deleted in this workspace.</p>
         {!onDelete && (
-          <Button variant="outline" size="sm" onClick={() => router.push("/issues")}>
+          <Button variant="outline" size="sm" onClick={() => router.push(paths.issues())}>
             <ChevronLeft className="mr-1 h-3.5 w-3.5" />
             Back to Issues
           </Button>
@@ -413,19 +438,132 @@ export function IssueDetail({ issueId, onDelete, defaultSidebarOpen = true, layo
     );
   }
 
-  return (
-    <ResizablePanelGroup orientation="horizontal" className="flex-1 min-h-0" defaultLayout={defaultLayout} onLayoutChanged={onLayoutChanged}>
-      <ResizablePanel id="content" minSize="50%">
-      {/* LEFT: Content area */}
-      <div className="flex h-full flex-col">
-        {/* Header bar */}
-        <div className="flex h-12 shrink-0 items-center justify-between border-b bg-background px-4 text-sm">
-          <div className="flex items-center gap-1.5 min-w-0">
+  const sidebarContent = (
+    <div className="space-y-5">
+      {/* Properties */}
+      <div>
+        <button
+          className={`flex w-full items-center gap-1 rounded-md px-2 py-1 text-xs font-medium transition-colors mb-2 hover:bg-accent/70 ${propertiesOpen ? "" : "text-muted-foreground hover:text-foreground"}`}
+          onClick={() => setPropertiesOpen(!propertiesOpen)}
+        >
+          Properties
+          <ChevronRight className={`!size-3 shrink-0 stroke-[2.5] text-muted-foreground transition-transform ${propertiesOpen ? "rotate-90" : ""}`} />
+        </button>
+        {propertiesOpen && <div className="grid grid-cols-[auto_1fr] gap-x-2 gap-y-0.5 pl-2">
+          <PropRow label="Status">
+            <StatusPicker status={issue.status} onUpdate={handleUpdateField} align="start" />
+          </PropRow>
+          <PropRow label="Priority">
+            <PriorityPicker priority={issue.priority} onUpdate={handleUpdateField} align="start" />
+          </PropRow>
+          <PropRow label="Assignee">
+            <AssigneePicker assigneeType={issue.assignee_type} assigneeId={issue.assignee_id} onUpdate={handleUpdateField} align="start" />
+          </PropRow>
+          <PropRow label="Due date">
+            <DueDatePicker dueDate={issue.due_date} onUpdate={handleUpdateField} />
+          </PropRow>
+          <PropRow label="Project">
+            <ProjectPicker projectId={issue.project_id} onUpdate={handleUpdateField} />
+          </PropRow>
+          <PropRow label="Labels">
+            <LabelPicker issueId={issue.id} align="start" />
+          </PropRow>
+        </div>}
+      </div>
+
+      {/* Parent issue */}
+      {parentIssue && (
+        <div>
+          <button
+            className={`flex w-full items-center gap-1 rounded-md px-2 py-1 text-xs font-medium transition-colors mb-2 hover:bg-accent/70 ${parentIssueOpen ? "" : "text-muted-foreground hover:text-foreground"}`}
+            onClick={() => setParentIssueOpen(!parentIssueOpen)}
+          >
+            Parent issue
+            <ChevronRight className={`!size-3 shrink-0 stroke-[2.5] text-muted-foreground transition-transform ${parentIssueOpen ? "rotate-90" : ""}`} />
+          </button>
+          {parentIssueOpen && <div className="pl-2">
+            <AppLink
+              href={paths.issueDetail(parentIssue.id)}
+              className="flex items-center gap-1.5 rounded-md px-2 py-1.5 -mx-2 text-xs hover:bg-accent/50 transition-colors group"
+            >
+              <StatusIcon status={parentIssue.status} className="h-3.5 w-3.5 shrink-0" />
+              <span className="text-muted-foreground shrink-0">{parentIssue.identifier}</span>
+              <span className="truncate group-hover:text-foreground">{parentIssue.title}</span>
+            </AppLink>
+          </div>}
+        </div>
+      )}
+
+      {/* Details */}
+      <div>
+        <button
+          className={`flex w-full items-center gap-1 rounded-md px-2 py-1 text-xs font-medium transition-colors mb-2 hover:bg-accent/70 ${detailsOpen ? "" : "text-muted-foreground hover:text-foreground"}`}
+          onClick={() => setDetailsOpen(!detailsOpen)}
+        >
+          Details
+          <ChevronRight className={`!size-3 shrink-0 stroke-[2.5] text-muted-foreground transition-transform ${detailsOpen ? "rotate-90" : ""}`} />
+        </button>
+        {detailsOpen && <div className="grid grid-cols-[auto_1fr] gap-x-2 gap-y-0.5 pl-2">
+          <PropRow label="Created by">
+            <ActorAvatar actorType={issue.creator_type} actorId={issue.creator_id} size={18} enableHoverCard />
+            <span className="cursor-pointer truncate">{getActorName(issue.creator_type, issue.creator_id)}</span>
+          </PropRow>
+          <PropRow label="Created">
+            <span className="text-muted-foreground">{shortDate(issue.created_at)}</span>
+          </PropRow>
+          <PropRow label="Updated">
+            <span className="text-muted-foreground">{shortDate(issue.updated_at)}</span>
+          </PropRow>
+        </div>}
+      </div>
+
+      {/* Execution log — active runs + collapsed past runs. Self-contained;
+          owns its own collapse state and WS subscriptions. Hides itself
+          when there are no runs to show. */}
+      <ExecutionLogSection issueId={id} />
+
+      {/* Token usage */}
+      {usage && usage.task_count > 0 && (
+        <div>
+          <button
+            className={`flex w-full items-center gap-1 rounded-md px-2 py-1 text-xs font-medium transition-colors mb-2 hover:bg-accent/70 ${tokenUsageOpen ? "" : "text-muted-foreground hover:text-foreground"}`}
+            onClick={() => setTokenUsageOpen(!tokenUsageOpen)}
+          >
+            Token usage
+            <ChevronRight className={`!size-3 shrink-0 stroke-[2.5] text-muted-foreground transition-transform ${tokenUsageOpen ? "rotate-90" : ""}`} />
+          </button>
+          {tokenUsageOpen && <div className="grid grid-cols-[auto_1fr] gap-x-2 gap-y-0.5 pl-2">
+            <PropRow label="Input">
+              <span className="text-muted-foreground">{formatTokenCount(usage.total_input_tokens)}</span>
+            </PropRow>
+            <PropRow label="Output">
+              <span className="text-muted-foreground">{formatTokenCount(usage.total_output_tokens)}</span>
+            </PropRow>
+            {(usage.total_cache_read_tokens > 0 || usage.total_cache_write_tokens > 0) && (
+              <PropRow label="Cache">
+                <span className="text-muted-foreground">
+                  {formatTokenCount(usage.total_cache_read_tokens)} read / {formatTokenCount(usage.total_cache_write_tokens)} write
+                </span>
+              </PropRow>
+            )}
+            <PropRow label="Runs">
+              <span className="text-muted-foreground">{usage.task_count}</span>
+            </PropRow>
+          </div>}
+        </div>
+      )}
+    </div>
+  );
+
+  const detailContent = (
+    <div className="flex h-full min-w-0 flex-1 flex-col">
+        <PageHeader className="gap-2 bg-background text-sm">
+          <div className="flex flex-1 items-center gap-1.5 min-w-0">
             {workspace && (
               <>
                 <AppLink
-                  href="/issues"
-                  className="text-muted-foreground hover:text-foreground transition-colors truncate shrink-0"
+                  href={paths.issues()}
+                  className="text-muted-foreground hover:text-foreground transition-colors shrink-0"
                 >
                   {workspace.name}
                 </AppLink>
@@ -435,7 +573,7 @@ export function IssueDetail({ issueId, onDelete, defaultSidebarOpen = true, layo
             {parentIssue && (
               <>
                 <AppLink
-                  href={`/issues/${parentIssue.id}`}
+                  href={paths.issueDetail(parentIssue.id)}
                   className="text-muted-foreground hover:text-foreground transition-colors truncate shrink-0"
                 >
                   {parentIssue.identifier}
@@ -443,288 +581,89 @@ export function IssueDetail({ issueId, onDelete, defaultSidebarOpen = true, layo
                 <ChevronRight className="h-3 w-3 text-muted-foreground/50 shrink-0" />
               </>
             )}
-            <span className="truncate text-muted-foreground">
-              {issue.identifier}
+            <span className="truncate font-medium text-foreground">
+              {issue.title}
             </span>
-            <ChevronRight className="h-3 w-3 text-muted-foreground/50 shrink-0" />
-            <span className="truncate">{issue.title}</span>
           </div>
           <div className="flex items-center gap-1 shrink-0">
-            {/* Issue navigation */}
-            {allIssues.length > 1 && (
-              <div className="flex items-center gap-0.5 mr-1">
-                <Tooltip>
-                  <TooltipTrigger
-                    render={
-                      <Button
-                        variant="ghost"
-                        size="icon-xs"
-                        className="text-muted-foreground"
-                        disabled={!prevIssue}
-                        onClick={() => prevIssue && router.push(`/issues/${prevIssue.id}`)}
-                      >
-                        <ChevronLeft className="h-4 w-4" />
-                      </Button>
-                    }
-                  />
-                  <TooltipContent side="bottom">Previous issue</TooltipContent>
-                </Tooltip>
-                <span className="text-xs text-muted-foreground tabular-nums px-0.5">
-                  {currentIndex >= 0 ? currentIndex + 1 : "?"} / {allIssues.length}
-                </span>
-                <Tooltip>
-                  <TooltipTrigger
-                    render={
-                      <Button
-                        variant="ghost"
-                        size="icon-xs"
-                        className="text-muted-foreground"
-                        disabled={!nextIssue}
-                        onClick={() => nextIssue && router.push(`/issues/${nextIssue.id}`)}
-                      >
-                        <ChevronRight className="h-4 w-4" />
-                      </Button>
-                    }
-                  />
-                  <TooltipContent side="bottom">Next issue</TooltipContent>
-                </Tooltip>
-              </div>
+            {onDone && issue.status !== "done" && issue.status !== "cancelled" && (
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      className="text-muted-foreground"
+                      onClick={() => { handleUpdateField({ status: "done" }); onDone?.(); }}
+                    >
+                      <CircleCheck />
+                    </Button>
+                  }
+                />
+                <TooltipContent side="bottom">Mark as done</TooltipContent>
+              </Tooltip>
+            )}
+            {onDone && issue.status === "done" && (
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      className="text-muted-foreground"
+                      onClick={() => { onDone(); }}
+                    >
+                      <Archive />
+                    </Button>
+                  }
+                />
+                <TooltipContent side="bottom">Archive</TooltipContent>
+              </Tooltip>
             )}
             <Tooltip>
               <TooltipTrigger
                 render={
                   <Button
                     variant="ghost"
-                    size="icon-xs"
-                    className={cn("text-muted-foreground", isPinned && "text-foreground")}
-                    onClick={() => {
-                      if (isPinned) {
-                        deletePin.mutate({ itemType: "issue", itemId: issue.id });
-                      } else {
-                        createPin.mutate({ item_type: "issue", item_id: issue.id });
-                      }
-                    }}
+                    size="icon-sm"
+                    className={cn("text-muted-foreground", actions.isPinned && "text-foreground")}
+                    onClick={actions.togglePin}
                   >
-                    {isPinned ? <PinOff /> : <Pin />}
+                    {actions.isPinned ? <PinOff /> : <Pin />}
                   </Button>
                 }
               />
-              <TooltipContent side="bottom">{isPinned ? "Unpin from sidebar" : "Pin to sidebar"}</TooltipContent>
+              <TooltipContent side="bottom">{actions.isPinned ? "Unpin from sidebar" : "Pin to sidebar"}</TooltipContent>
             </Tooltip>
-            <DropdownMenu>
-              <DropdownMenuTrigger
-                render={
-                  <Button variant="ghost" size="icon-xs" className="text-muted-foreground">
-                    <MoreHorizontal className="h-4 w-4" />
-                  </Button>
-                }
-              />
-              <DropdownMenuContent align="end" className="w-auto">
-                {/* Status */}
-                <DropdownMenuSub>
-                  <DropdownMenuSubTrigger>
-                    <StatusIcon status={issue.status} className="h-3.5 w-3.5" />
-                    Status
-                  </DropdownMenuSubTrigger>
-                  <DropdownMenuSubContent>
-                    {ALL_STATUSES.map((s) => (
-                      <DropdownMenuItem
-                        key={s}
-                        onClick={() => handleUpdateField({ status: s })}
-                      >
-                        <StatusIcon status={s} className="h-3.5 w-3.5" />
-                        {STATUS_CONFIG[s].label}
-                        {issue.status === s && <span className="ml-auto text-xs text-muted-foreground">✓</span>}
-                      </DropdownMenuItem>
-                    ))}
-                  </DropdownMenuSubContent>
-                </DropdownMenuSub>
-
-                {/* Priority */}
-                <DropdownMenuSub>
-                  <DropdownMenuSubTrigger>
-                    <PriorityIcon priority={issue.priority} />
-                    Priority
-                  </DropdownMenuSubTrigger>
-                  <DropdownMenuSubContent>
-                    {PRIORITY_ORDER.map((p) => (
-                      <DropdownMenuItem
-                        key={p}
-                        onClick={() => handleUpdateField({ priority: p })}
-                      >
-                        <span className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-medium ${PRIORITY_CONFIG[p].badgeBg} ${PRIORITY_CONFIG[p].badgeText}`}>
-                          <PriorityIcon priority={p} className="h-3 w-3" inheritColor />
-                          {PRIORITY_CONFIG[p].label}
-                        </span>
-                        {issue.priority === p && <span className="ml-auto text-xs text-muted-foreground">✓</span>}
-                      </DropdownMenuItem>
-                    ))}
-                  </DropdownMenuSubContent>
-                </DropdownMenuSub>
-
-                {/* Assignee */}
-                <DropdownMenuSub>
-                  <DropdownMenuSubTrigger>
-                    <UserMinus className="h-3.5 w-3.5" />
-                    Assignee
-                  </DropdownMenuSubTrigger>
-                  <DropdownMenuSubContent>
-                    <DropdownMenuItem
-                      onClick={() => handleUpdateField({ assignee_type: null, assignee_id: null })}
-                    >
-                      <UserMinus className="h-3.5 w-3.5 text-muted-foreground" />
-                      Unassigned
-                      {!issue.assignee_type && <span className="ml-auto text-xs text-muted-foreground">✓</span>}
-                    </DropdownMenuItem>
-                    {members.map((m) => (
-                      <DropdownMenuItem
-                        key={m.user_id}
-                        onClick={() => handleUpdateField({ assignee_type: "member", assignee_id: m.user_id })}
-                      >
-                        <ActorAvatar actorType="member" actorId={m.user_id} size={16} />
-                        {m.name}
-                        {issue.assignee_type === "member" && issue.assignee_id === m.user_id && <span className="ml-auto text-xs text-muted-foreground">✓</span>}
-                      </DropdownMenuItem>
-                    ))}
-                    {agents.filter((a) => !a.archived_at && canAssignAgent(a, user?.id, currentMemberRole)).map((a) => (
-                      <DropdownMenuItem
-                        key={a.id}
-                        onClick={() => handleUpdateField({ assignee_type: "agent", assignee_id: a.id })}
-                      >
-                        <ActorAvatar actorType="agent" actorId={a.id} size={16} />
-                        {a.name}
-                        {issue.assignee_type === "agent" && issue.assignee_id === a.id && <span className="ml-auto text-xs text-muted-foreground">✓</span>}
-                      </DropdownMenuItem>
-                    ))}
-                  </DropdownMenuSubContent>
-                </DropdownMenuSub>
-
-                {/* Due date */}
-                <DropdownMenuSub>
-                  <DropdownMenuSubTrigger>
-                    <Calendar className="h-3.5 w-3.5" />
-                    Due date
-                  </DropdownMenuSubTrigger>
-                  <DropdownMenuSubContent>
-                    <DropdownMenuItem onClick={() => handleUpdateField({ due_date: new Date().toISOString() })}>
-                      Today
-                    </DropdownMenuItem>
-                    <DropdownMenuItem onClick={() => {
-                      const d = new Date(); d.setDate(d.getDate() + 1);
-                      handleUpdateField({ due_date: d.toISOString() });
-                    }}>
-                      Tomorrow
-                    </DropdownMenuItem>
-                    <DropdownMenuItem onClick={() => {
-                      const d = new Date(); d.setDate(d.getDate() + 7);
-                      handleUpdateField({ due_date: d.toISOString() });
-                    }}>
-                      Next week
-                    </DropdownMenuItem>
-                    {issue.due_date && (
-                      <>
-                        <DropdownMenuSeparator />
-                        <DropdownMenuItem onClick={() => handleUpdateField({ due_date: null })}>
-                          Clear date
-                        </DropdownMenuItem>
-                      </>
-                    )}
-                  </DropdownMenuSubContent>
-                </DropdownMenuSub>
-
-                <DropdownMenuSeparator />
-
-                {/* Create sub-issue */}
-                <DropdownMenuItem onClick={() => {
-                  useModalStore.getState().open("create-issue", {
-                    parent_issue_id: issue.id,
-                    parent_issue_identifier: issue.identifier,
-                  });
-                }}>
-                  <Plus className="h-3.5 w-3.5" />
-                  Create sub-issue
-                </DropdownMenuItem>
-
-                {/* Pin / Unpin */}
-                <DropdownMenuItem onClick={() => {
-                  if (isPinned) {
-                    deletePin.mutate({ itemType: "issue", itemId: issue.id });
-                  } else {
-                    createPin.mutate({ item_type: "issue", item_id: issue.id });
-                  }
-                }}>
-                  {isPinned ? <PinOff className="h-3.5 w-3.5" /> : <Pin className="h-3.5 w-3.5" />}
-                  {isPinned ? "Unpin from sidebar" : "Pin to sidebar"}
-                </DropdownMenuItem>
-
-                {/* Copy link */}
-                <DropdownMenuItem onClick={() => {
-                  const url = router.getShareableUrl
-                    ? router.getShareableUrl(router.pathname)
-                    : window.location.href;
-                  navigator.clipboard.writeText(url);
-                  toast.success("Link copied");
-                }}>
-                  <Link2 className="h-3.5 w-3.5" />
-                  Copy link
-                </DropdownMenuItem>
-
-                <DropdownMenuSeparator />
-
-                {/* Delete */}
-                <DropdownMenuItem
-                  variant="destructive"
-                  onClick={() => setDeleteDialogOpen(true)}
-                >
-                  <Trash2 className="h-3.5 w-3.5" />
-                  Delete issue
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
+            <IssueActionsDropdown
+              issue={issue}
+              align="end"
+              // When a parent passes `onDelete`, we detect deletion via effect
+              // above and skip navigation. Otherwise the modal navigates for us.
+              onDeletedNavigateTo={onDelete ? undefined : paths.issues()}
+              trigger={
+                <Button variant="ghost" size="icon-sm" className="text-muted-foreground">
+                  <MoreHorizontal />
+                </Button>
+              }
+            />
             <Tooltip>
               <TooltipTrigger
                 render={
                   <Button
                     variant={sidebarOpen ? "secondary" : "ghost"}
-                    size="icon-xs"
+                    size="icon-sm"
                     className={sidebarOpen ? "" : "text-muted-foreground"}
-                    onClick={() => {
-                      const panel = sidebarRef.current;
-                      if (!panel) return;
-                      if (panel.isCollapsed()) panel.expand();
-                      else panel.collapse();
-                    }}
+                    onClick={handleToggleSidebar}
                   >
-                    <PanelRight className="h-4 w-4" />
+                    <PanelRight />
                   </Button>
                 }
               />
               <TooltipContent side="bottom">Toggle sidebar</TooltipContent>
             </Tooltip>
           </div>
-
-            {/* Delete confirmation dialog (controlled by state) */}
-            <AlertDialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
-              <AlertDialogContent>
-                <AlertDialogHeader>
-                  <AlertDialogTitle>Delete issue</AlertDialogTitle>
-                  <AlertDialogDescription>
-                    This will permanently delete this issue and all its comments. This action cannot be undone.
-                  </AlertDialogDescription>
-                </AlertDialogHeader>
-                <AlertDialogFooter>
-                  <AlertDialogCancel>Cancel</AlertDialogCancel>
-                  <AlertDialogAction
-                    onClick={handleDelete}
-                    disabled={deleting}
-                    className="bg-destructive text-white hover:bg-destructive/90"
-                  >
-                    {deleting ? "Deleting..." : "Delete"}
-                  </AlertDialogAction>
-                </AlertDialogFooter>
-              </AlertDialogContent>
-            </AlertDialog>
-          </div>
+        </PageHeader>
 
         {/* Content — scrollable */}
         <div ref={scrollContainerRef} className="relative flex-1 overflow-y-auto">
@@ -742,7 +681,7 @@ export function IssueDetail({ issueId, onDelete, defaultSidebarOpen = true, layo
 
           {parentIssue && (
             <AppLink
-              href={`/issues/${parentIssue.id}`}
+              href={paths.issueDetail(parentIssue.id)}
               className="mt-2 inline-flex max-w-full items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors group/parent"
             >
               <span className="font-medium shrink-0">Sub-issue of</span>
@@ -771,25 +710,19 @@ export function IssueDetail({ issueId, onDelete, defaultSidebarOpen = true, layo
               key={id}
               defaultValue={issue.description || ""}
               placeholder="Add description..."
-              onUpdate={(md) => handleUpdateField({ description: md || undefined })}
+              onUpdate={(md) => handleUpdateField({ description: md })}
               onUploadFile={handleDescriptionUpload}
               debounceMs={1500}
+              currentIssueId={id}
             />
 
             <div className="flex items-center gap-1 mt-3">
-              {reactionsLoading ? (
-                <div className="flex items-center gap-1">
-                  <Skeleton className="h-7 w-14 rounded-full" />
-                  <Skeleton className="h-7 w-14 rounded-full" />
-                </div>
-              ) : (
-                <ReactionBar
-                  reactions={issueReactions}
-                  currentUserId={user?.id}
-                  onToggle={handleToggleIssueReaction}
-                  getActorName={getActorName}
-                />
-              )}
+              <ReactionBar
+                reactions={issueReactions}
+                currentUserId={user?.id}
+                onToggle={handleToggleIssueReaction}
+                getActorName={getActorName}
+              />
               <FileUploadButton
                 size="sm"
                 onSelect={(file) => descEditorRef.current?.uploadFile(file)}
@@ -872,7 +805,7 @@ export function IssueDetail({ issueId, onDelete, defaultSidebarOpen = true, layo
                       return (
                         <AppLink
                           key={child.id}
-                          href={`/issues/${child.id}`}
+                          href={paths.issueDetail(child.id)}
                           className="flex items-center gap-2.5 px-3 py-2 hover:bg-accent/50 transition-colors group/row"
                         >
                           <StatusIcon
@@ -898,6 +831,7 @@ export function IssueDetail({ issueId, onDelete, defaultSidebarOpen = true, layo
                               actorId={child.assignee_id}
                               size={20}
                               className="shrink-0"
+                              enableHoverCard
                             />
                           ) : (
                             <span
@@ -923,15 +857,6 @@ export function IssueDetail({ issueId, onDelete, defaultSidebarOpen = true, layo
                 <h2 className="text-base font-semibold">Activity</h2>
               </div>
               <div className="flex items-center gap-2">
-                {subscribersLoading ? (
-                  <div className="flex items-center gap-1">
-                    <Skeleton className="h-4 w-16" />
-                    <div className="flex -space-x-1">
-                      <Skeleton className="h-6 w-6 rounded-full" />
-                      <Skeleton className="h-6 w-6 rounded-full" />
-                    </div>
-                  </div>
-                ) : (<>
                 <button
                   onClick={handleToggleSubscribe}
                   className="text-xs text-muted-foreground hover:text-foreground transition-colors"
@@ -948,6 +873,7 @@ export function IssueDetail({ issueId, onDelete, defaultSidebarOpen = true, layo
                             actorType={sub.user_type}
                             actorId={sub.user_id}
                             size={24}
+                            enableHoverCard
                           />
                         ))}
                         {subscribers.length > 4 && (
@@ -997,7 +923,7 @@ export function IssueDetail({ issueId, onDelete, defaultSidebarOpen = true, layo
                                   className="flex items-center gap-2.5"
                                 >
                                   <Checkbox checked={isSubbed} className="pointer-events-none" />
-                                  <ActorAvatar actorType="agent" actorId={a.id} size={22} />
+                                  <ActorAvatar actorType="agent" actorId={a.id} size={22} showStatusDot />
                                   <span className="truncate flex-1">{a.name}</span>
 
                                 </CommandItem>
@@ -1009,147 +935,86 @@ export function IssueDetail({ issueId, onDelete, defaultSidebarOpen = true, layo
                     </Command>
                   </PopoverContent>
                 </Popover>
-                </>)}
               </div>
             </div>
 
-            {/* Agent live output — sticky inside the Activity section so it
-                stays pinned while scrolling through TaskRunHistory + comments. */}
-            <AgentLiveCard issueId={id} />
-
-            {/* Agent execution history */}
-            <div className="mt-3">
-              <TaskRunHistory issueId={id} />
-            </div>
+            {/* Agent live output — sticky banner in the activity section,
+                keyed by issue id so switching issues remounts the card and
+                clears any in-flight task state from the previous issue.
+                The execution log itself (per-task timeline + past runs)
+                lives in the right panel via ExecutionLogSection — this
+                card is just a header-style "agent is working" anchor. */}
+            <AgentLiveCard key={id} issueId={id} />
 
             {/* Timeline entries */}
             <div className="mt-4 flex flex-col gap-3">
-              {timelineLoading ? (
-                <div className="space-y-4">
-                  {Array.from({ length: 3 }).map((_, i) => (
-                    <div key={i} className="flex items-start gap-3 px-4">
-                      <Skeleton className="h-8 w-8 rounded-full shrink-0" />
-                      <div className="flex-1 space-y-2">
-                        <Skeleton className="h-4 w-32" />
-                        <Skeleton className="h-16 w-full rounded-lg" />
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              ) : (() => {
-                const topLevel = timeline.filter((e) => e.type === "activity" || !e.parent_id);
-                const repliesByParent = new Map<string, TimelineEntry[]>();
-                for (const e of timeline) {
-                  if (e.type === "comment" && e.parent_id) {
-                    const list = repliesByParent.get(e.parent_id) ?? [];
-                    list.push(e);
-                    repliesByParent.set(e.parent_id, list);
-                  }
-                }
-
-                // Coalesce: same actor + same action within 2 min → keep last only
-                const COALESCE_MS = 2 * 60 * 1000;
-                const coalesced: TimelineEntry[] = [];
-                for (const entry of topLevel) {
-                  if (entry.type === "activity") {
-                    const prev = coalesced[coalesced.length - 1];
-                    if (
-                      prev?.type === "activity" &&
-                      prev.action === entry.action &&
-                      prev.actor_type === entry.actor_type &&
-                      prev.actor_id === entry.actor_id &&
-                      Math.abs(new Date(entry.created_at).getTime() - new Date(prev.created_at).getTime()) <= COALESCE_MS
-                    ) {
-                      // Replace previous with this one (keep the later result)
-                      coalesced[coalesced.length - 1] = entry;
-                      continue;
-                    }
-                  }
-                  coalesced.push(entry);
-                }
-
-                // Group consecutive activities together so the connector line works
-                const groups: { type: "activities" | "comment"; entries: TimelineEntry[] }[] = [];
-                for (const entry of coalesced) {
-                  if (entry.type === "activity") {
-                    const last = groups[groups.length - 1];
-                    if (last?.type === "activities") {
-                      last.entries.push(entry);
-                    } else {
-                      groups.push({ type: "activities", entries: [entry] });
-                    }
-                  } else {
-                    groups.push({ type: "comment", entries: [entry] });
-                  }
-                }
-
-                return groups.map((group) => {
-                  if (group.type === "comment") {
-                    const entry = group.entries[0]!;
-                    return (
-                      <div key={entry.id} id={`comment-${entry.id}`}>
-                        <CommentCard
-                          issueId={id}
-                          entry={entry}
-                          allReplies={repliesByParent}
-                          currentUserId={user?.id}
-                          onReply={submitReply}
-                          onEdit={editComment}
-                          onDelete={deleteComment}
-                          onToggleReaction={handleToggleReaction}
-                          highlightedCommentId={highlightedId}
-                        />
-                      </div>
-                    );
-                  }
-
+              {timelineView.groups.map((group) => {
+                if (group.type === "comment") {
+                  const entry = group.entries[0]!;
                   return (
-                    <div key={group.entries[0]!.id} className="px-4 flex flex-col gap-3">
-                      {group.entries.map((entry, _idx) => {
-                        const details = (entry.details ?? {}) as Record<string, string>;
-                        const isStatusChange = entry.action === "status_changed";
-                        const isPriorityChange = entry.action === "priority_changed";
-                        const isDueDateChange = entry.action === "due_date_changed";
-
-                        let leadIcon: React.ReactNode;
-                        if (isStatusChange && details.to) {
-                          leadIcon = <StatusIcon status={details.to as IssueStatus} className="h-4 w-4 shrink-0" />;
-                        } else if (isPriorityChange && details.to) {
-                          leadIcon = <PriorityIcon priority={details.to as IssuePriority} className="h-4 w-4 shrink-0" />;
-                        } else if (isDueDateChange) {
-                          leadIcon = <Calendar className="h-4 w-4 shrink-0 text-muted-foreground" />;
-                        } else {
-                          leadIcon = <ActorAvatar actorType={entry.actor_type} actorId={entry.actor_id} size={16} />;
-                        }
-
-                        return (
-                          <div key={entry.id} className="flex items-center text-xs text-muted-foreground">
-                            <div className="mr-2 flex w-4 shrink-0 justify-center">
-                              {leadIcon}
-                            </div>
-                            <div className="flex min-w-0 flex-1 items-center gap-1">
-                              <span className="shrink-0 font-medium">{getActorName(entry.actor_type, entry.actor_id)}</span>
-                              <span className="truncate">{formatActivity(entry, getActorName)}</span>
-                              <Tooltip>
-                                <TooltipTrigger
-                                  render={
-                                    <span className="ml-auto shrink-0 cursor-default">
-                                      {timeAgo(entry.created_at)}
-                                    </span>
-                                  }
-                                />
-                                <TooltipContent side="top">
-                                  {new Date(entry.created_at).toLocaleString()}
-                                </TooltipContent>
-                              </Tooltip>
-                            </div>
-                          </div>
-                        );
-                      })}
+                    <div key={entry.id} id={`comment-${entry.id}`}>
+                      <CommentCard
+                        issueId={id}
+                        entry={entry}
+                        allReplies={timelineView.repliesByParent}
+                        currentUserId={user?.id}
+                        canModerate={canModerateComments}
+                        onReply={submitReply}
+                        onEdit={editComment}
+                        onDelete={deleteComment}
+                        onToggleReaction={handleToggleReaction}
+                        highlightedCommentId={highlightedId}
+                      />
                     </div>
                   );
-                });
-              })()}
+                }
+
+                return (
+                  <div key={group.entries[0]!.id} className="px-4 flex flex-col gap-3">
+                    {group.entries.map((entry, _idx) => {
+                      const details = (entry.details ?? {}) as Record<string, string>;
+                      const isStatusChange = entry.action === "status_changed";
+                      const isPriorityChange = entry.action === "priority_changed";
+                      const isDueDateChange = entry.action === "due_date_changed";
+
+                      let leadIcon: React.ReactNode;
+                      if (isStatusChange && details.to) {
+                        leadIcon = <StatusIcon status={details.to as IssueStatus} className="h-4 w-4 shrink-0" />;
+                      } else if (isPriorityChange && details.to) {
+                        leadIcon = <PriorityIcon priority={details.to as IssuePriority} className="h-4 w-4 shrink-0" />;
+                      } else if (isDueDateChange) {
+                        leadIcon = <Calendar className="h-4 w-4 shrink-0 text-muted-foreground" />;
+                      } else {
+                        leadIcon = <ActorAvatar actorType={entry.actor_type} actorId={entry.actor_id} size={16} />;
+                      }
+
+                      return (
+                        <div key={entry.id} className="flex items-center text-xs text-muted-foreground">
+                          <div className="mr-2 flex w-4 shrink-0 justify-center">
+                            {leadIcon}
+                          </div>
+                          <div className="flex min-w-0 flex-1 items-center gap-1">
+                            <span className="shrink-0 font-medium">{getActorName(entry.actor_type, entry.actor_id)}</span>
+                            <span className="truncate">{formatActivity(entry, getActorName)}</span>
+                            <Tooltip>
+                              <TooltipTrigger
+                                render={
+                                  <span className="ml-auto shrink-0 cursor-default">
+                                    {timeAgo(entry.created_at)}
+                                  </span>
+                                }
+                              />
+                              <TooltipContent side="top">
+                                {new Date(entry.created_at).toLocaleString()}
+                              </TooltipContent>
+                            </Tooltip>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })}
             </div>
 
             {/* Bottom comment input — no avatar, full width */}
@@ -1160,6 +1025,25 @@ export function IssueDetail({ issueId, onDelete, defaultSidebarOpen = true, layo
         </div>
         </div>
       </div>
+  );
+
+  if (isMobile) {
+    return (
+      <div className="flex flex-1 min-h-0">
+        {detailContent}
+        <Sheet open={mobileSidebarOpen} onOpenChange={setMobileSidebarOpen}>
+          <SheetContent side="right" showCloseButton={false} className="w-[320px] overflow-y-auto p-4">
+            {sidebarContent}
+          </SheetContent>
+        </Sheet>
+      </div>
+    );
+  }
+
+  return (
+    <ResizablePanelGroup orientation="horizontal" className="flex-1 min-h-0" defaultLayout={defaultLayout} onLayoutChanged={onLayoutChanged}>
+      <ResizablePanel id="content" minSize="50%">
+        {detailContent}
       </ResizablePanel>
       <ResizableHandle />
       <ResizablePanel
@@ -1170,144 +1054,11 @@ export function IssueDetail({ issueId, onDelete, defaultSidebarOpen = true, layo
         collapsible
         groupResizeBehavior="preserve-pixel-size"
         panelRef={sidebarRef}
-        onResize={(size) => setSidebarOpen(size.inPixels > 0)}
+        onResize={(size) => setDesktopSidebarOpen(size.inPixels > 0)}
       >
-      {/* RIGHT: Properties sidebar */}
       <div className="overflow-y-auto border-l h-full">
-        <div className="p-4 space-y-5">
-          {/* Properties section */}
-          <div>
-            <button
-              className={`flex w-full items-center gap-1 text-xs font-medium transition-colors mb-2 ${propertiesOpen ? "" : "text-muted-foreground hover:text-foreground"}`}
-              onClick={() => setPropertiesOpen(!propertiesOpen)}
-            >
-              <ChevronRight className={`h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform ${propertiesOpen ? "rotate-90" : ""}`} />
-              Properties
-            </button>
-
-            {propertiesOpen && <div className="space-y-0.5 pl-2">
-              {/* Status */}
-              <PropRow label="Status">
-                <StatusPicker
-                  status={issue.status}
-                  onUpdate={handleUpdateField}
-                  align="start"
-                />
-              </PropRow>
-
-              {/* Priority */}
-              <PropRow label="Priority">
-                <PriorityPicker
-                  priority={issue.priority}
-                  onUpdate={handleUpdateField}
-                  align="start"
-                />
-              </PropRow>
-
-              {/* Assignee */}
-              <PropRow label="Assignee">
-                <AssigneePicker
-                  assigneeType={issue.assignee_type}
-                  assigneeId={issue.assignee_id}
-                  onUpdate={handleUpdateField}
-                  align="start"
-                />
-              </PropRow>
-
-              {/* Due date */}
-              <PropRow label="Due date">
-                <DueDatePicker
-                  dueDate={issue.due_date}
-                  onUpdate={handleUpdateField}
-                />
-              </PropRow>
-
-              {/* Project */}
-              <PropRow label="Project">
-                <ProjectPicker
-                  projectId={issue.project_id}
-                  onUpdate={handleUpdateField}
-                />
-              </PropRow>
-            </div>}
-          </div>
-
-          {/* Parent issue */}
-          {parentIssue && (
-            <div>
-              <div className="text-xs font-medium mb-2 flex items-center gap-1">
-                <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground rotate-90" />
-                Parent issue
-              </div>
-              <div className="pl-2">
-                <AppLink
-                  href={`/issues/${parentIssue.id}`}
-                  className="flex items-center gap-1.5 rounded-md px-2 py-1.5 -mx-2 text-xs hover:bg-accent/50 transition-colors group"
-                >
-                  <StatusIcon status={parentIssue.status} className="h-3.5 w-3.5 shrink-0" />
-                  <span className="text-muted-foreground shrink-0">{parentIssue.identifier}</span>
-                  <span className="truncate group-hover:text-foreground">{parentIssue.title}</span>
-                </AppLink>
-              </div>
-            </div>
-          )}
-
-          {/* Details section */}
-          <div>
-            <button
-              className={`flex w-full items-center gap-1 text-xs font-medium transition-colors mb-2 ${detailsOpen ? "" : "text-muted-foreground hover:text-foreground"}`}
-              onClick={() => setDetailsOpen(!detailsOpen)}
-            >
-              <ChevronRight className={`h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform ${detailsOpen ? "rotate-90" : ""}`} />
-              Details
-            </button>
-
-            {detailsOpen && <div className="space-y-0.5 pl-2">
-              <PropRow label="Created by">
-                <ActorAvatar
-                  actorType={issue.creator_type}
-                  actorId={issue.creator_id}
-                  size={18}
-                />
-                <span className="truncate">{getActorName(issue.creator_type, issue.creator_id)}</span>
-              </PropRow>
-              <PropRow label="Created">
-                <span className="text-muted-foreground">{shortDate(issue.created_at)}</span>
-              </PropRow>
-              <PropRow label="Updated">
-                <span className="text-muted-foreground">{shortDate(issue.updated_at)}</span>
-              </PropRow>
-            </div>}
-          </div>
-
-          {/* Token usage */}
-          {usage && usage.task_count > 0 && (
-            <div>
-              <div className="text-xs font-medium mb-2 flex items-center gap-1">
-                <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground rotate-90" />
-                Token usage
-              </div>
-              <div className="space-y-0.5 pl-2">
-                <PropRow label="Input">
-                  <span className="text-muted-foreground">{formatTokenCount(usage.total_input_tokens)}</span>
-                </PropRow>
-                <PropRow label="Output">
-                  <span className="text-muted-foreground">{formatTokenCount(usage.total_output_tokens)}</span>
-                </PropRow>
-                {(usage.total_cache_read_tokens > 0 || usage.total_cache_write_tokens > 0) && (
-                  <PropRow label="Cache">
-                    <span className="text-muted-foreground">
-                      {formatTokenCount(usage.total_cache_read_tokens)} read / {formatTokenCount(usage.total_cache_write_tokens)} write
-                    </span>
-                  </PropRow>
-                )}
-                <PropRow label="Runs">
-                  <span className="text-muted-foreground">{usage.task_count}</span>
-                </PropRow>
-              </div>
-            </div>
-          )}
-
+        <div className="p-4">
+          {sidebarContent}
         </div>
       </div>
       </ResizablePanel>

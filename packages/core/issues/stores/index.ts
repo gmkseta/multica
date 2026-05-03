@@ -1,4 +1,5 @@
 export { useIssueSelectionStore } from "./selection-store";
+export { useCreateModeStore, type CreateMode } from "./create-mode-store";
 export { useIssueDraftStore } from "./draft-store";
 export { useRecentIssuesStore, type RecentIssueEntry } from "./recent-issues-store";
 export {
@@ -7,6 +8,7 @@ export {
   useViewStoreApi,
 } from "./view-store-context";
 export { useIssuesScopeStore, type IssuesScope } from "./issues-scope-store";
+export { useCommentCollapseStore } from "./comment-collapse-store";
 export {
   myIssuesViewStore,
   type MyIssuesViewState,
@@ -17,8 +19,7 @@ export {
   createIssueViewStore,
   viewStoreSlice,
   viewStorePersistOptions,
-  registerViewStoreForWorkspaceSync,
-  initFilterWorkspaceSync,
+  useClearFiltersOnWorkspaceChange,
   SORT_OPTIONS,
   CARD_PROPERTY_OPTIONS,
   type ViewMode,

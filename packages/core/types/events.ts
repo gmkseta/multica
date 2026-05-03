@@ -3,8 +3,9 @@ import type { Agent } from "./agent";
 import type { InboxItem } from "./inbox";
 import type { Comment, Reaction } from "./comment";
 import type { TimelineEntry } from "./activity";
-import type { Workspace, MemberWithUser } from "./workspace";
+import type { Workspace, MemberWithUser, Invitation } from "./workspace";
 import type { Project } from "./project";
+import type { Label } from "./label";
 
 // WebSocket event types (matching Go server protocol/events.go)
 export type WSEventType =
@@ -18,6 +19,7 @@ export type WSEventType =
   | "agent:created"
   | "agent:archived"
   | "agent:restored"
+  | "task:queued"
   | "task:dispatch"
   | "task:progress"
   | "task:completed"
@@ -48,11 +50,21 @@ export type WSEventType =
   | "issue_reaction:removed"
   | "chat:message"
   | "chat:done"
+  | "chat:session_read"
   | "project:created"
   | "project:updated"
   | "project:deleted"
+  | "label:created"
+  | "label:updated"
+  | "label:deleted"
+  | "issue_labels:changed"
   | "pin:created"
-  | "pin:deleted";
+  | "pin:deleted"
+  | "pin:reordered"
+  | "invitation:created"
+  | "invitation:accepted"
+  | "invitation:declined"
+  | "invitation:revoked";
 
 export interface WSMessage<T = unknown> {
   type: WSEventType;
@@ -70,6 +82,11 @@ export interface IssueUpdatedPayload {
 
 export interface IssueDeletedPayload {
   issue_id: string;
+}
+
+export interface IssueLabelsChangedPayload {
+  issue_id: string;
+  labels: Label[];
 }
 
 export interface AgentStatusPayload {
@@ -170,6 +187,7 @@ export interface ActivityCreatedPayload {
 export interface TaskMessagePayload {
   task_id: string;
   issue_id: string;
+  chat_session_id?: string;
   seq: number;
   type: "text" | "thinking" | "tool_use" | "tool_result" | "error";
   tool?: string;
@@ -178,10 +196,27 @@ export interface TaskMessagePayload {
   output?: string;
 }
 
+export interface TaskQueuedPayload {
+  task_id: string;
+  agent_id: string;
+  issue_id: string;
+  chat_session_id?: string;
+  status: string;
+}
+
+export interface TaskDispatchPayload {
+  task_id: string;
+  agent_id: string;
+  issue_id: string;
+  runtime_id: string;
+  chat_session_id?: string;
+}
+
 export interface TaskCompletedPayload {
   task_id: string;
   agent_id: string;
   issue_id: string;
+  chat_session_id?: string;
   status: string;
 }
 
@@ -189,6 +224,7 @@ export interface TaskFailedPayload {
   task_id: string;
   agent_id: string;
   issue_id: string;
+  chat_session_id?: string;
   status: string;
 }
 
@@ -196,6 +232,7 @@ export interface TaskCancelledPayload {
   task_id: string;
   agent_id: string;
   issue_id: string;
+  chat_session_id?: string;
   status: string;
 }
 
@@ -239,6 +276,10 @@ export interface ChatDonePayload {
   content?: string;
 }
 
+export interface ChatSessionReadPayload {
+  chat_session_id: string;
+}
+
 export interface ProjectCreatedPayload {
   project: Project;
 }
@@ -249,4 +290,24 @@ export interface ProjectUpdatedPayload {
 
 export interface ProjectDeletedPayload {
   project_id: string;
+}
+
+export interface InvitationCreatedPayload {
+  invitation: Invitation;
+  workspace_name?: string;
+}
+
+export interface InvitationAcceptedPayload {
+  invitation_id: string;
+  member: MemberWithUser;
+}
+
+export interface InvitationDeclinedPayload {
+  invitation_id: string;
+  invitee_email: string;
+}
+
+export interface InvitationRevokedPayload {
+  invitation_id: string;
+  invitee_email: string;
 }

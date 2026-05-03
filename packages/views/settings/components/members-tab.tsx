@@ -1,9 +1,9 @@
 "use client";
 
 import { useState } from "react";
-import { Crown, Shield, User, Plus, MoreHorizontal, UserMinus, Users } from "lucide-react";
+import { Crown, Shield, User, Plus, MoreHorizontal, UserMinus, Users, Clock, X, Mail } from "lucide-react";
 import { ActorAvatar } from "../../common/actor-avatar";
-import type { MemberWithUser, MemberRole } from "@multica/core/types";
+import type { MemberWithUser, MemberRole, Invitation } from "@multica/core/types";
 import { Input } from "@multica/ui/components/ui/input";
 import { Button } from "@multica/ui/components/ui/button";
 import { Card, CardContent } from "@multica/ui/components/ui/card";
@@ -38,9 +38,9 @@ import {
 import { toast } from "sonner";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useAuthStore } from "@multica/core/auth";
-import { useWorkspaceStore } from "@multica/core/workspace";
 import { useWorkspaceId } from "@multica/core/hooks";
-import { memberListOptions, workspaceKeys } from "@multica/core/workspace/queries";
+import { useCurrentWorkspace } from "@multica/core/paths";
+import { memberListOptions, invitationListOptions, workspaceKeys } from "@multica/core/workspace/queries";
 import { api } from "@multica/core/api";
 
 const roleConfig: Record<MemberRole, { label: string; icon: typeof Crown; description: string }> = {
@@ -53,6 +53,7 @@ function MemberRow({
   member,
   canManage,
   canManageOwners,
+  ownerCount,
   isSelf,
   busy,
   onRoleChange,
@@ -61,6 +62,9 @@ function MemberRow({
   member: MemberWithUser;
   canManage: boolean;
   canManageOwners: boolean;
+  /** Total number of owners in this workspace — needed to gate demoting the
+   *  last owner per `workspace.go:497-507`. */
+  ownerCount: number;
   isSelf: boolean;
   busy: boolean;
   onRoleChange: (role: MemberRole) => void;
@@ -70,6 +74,7 @@ function MemberRow({
   const RoleIcon = rc.icon;
   const canEditRole = canManage && !isSelf && (member.role !== "owner" || canManageOwners);
   const canRemove = canManage && !isSelf && (member.role !== "owner" || canManageOwners);
+  const isLastOwner = member.role === "owner" && ownerCount <= 1;
   const showMenu = canEditRole || canRemove;
 
   return (
@@ -100,16 +105,31 @@ function MemberRow({
                     ([role, config]) => {
                       if (role === "owner" && !canManageOwners) return null;
                       const Icon = config.icon;
+                      // Demoting the last owner would leave the workspace
+                      // ownerless — server rejects with 400, mirror that
+                      // here as a disabled option with explanation.
+                      const wouldDemoteLastOwner =
+                        isLastOwner && role !== "owner";
                       return (
                         <DropdownMenuItem
                           key={role}
-                          onClick={() => onRoleChange(role)}
+                          onClick={() =>
+                            wouldDemoteLastOwner ? undefined : onRoleChange(role)
+                          }
+                          disabled={wouldDemoteLastOwner}
+                          title={
+                            wouldDemoteLastOwner
+                              ? "Promote another member to owner first — a workspace must keep at least one owner."
+                              : undefined
+                          }
                         >
                           <Icon className="h-3.5 w-3.5" />
                           <div className="flex flex-col">
                             <span>{config.label}</span>
                             <span className="text-xs text-muted-foreground font-normal">
-                              {config.description}
+                              {wouldDemoteLastOwner
+                                ? "Cannot demote the last owner"
+                                : config.description}
                             </span>
                           </div>
                           {member.role === role && (
@@ -140,17 +160,62 @@ function MemberRow({
   );
 }
 
+function InvitationRow({
+  invitation,
+  canManage,
+  onRevoke,
+  busy,
+}: {
+  invitation: Invitation;
+  canManage: boolean;
+  onRevoke: () => void;
+  busy: boolean;
+}) {
+  const rc = roleConfig[invitation.role];
+
+  return (
+    <div className="flex items-center gap-3 px-4 py-3">
+      <div className="flex h-8 w-8 items-center justify-center rounded-full bg-muted">
+        <Mail className="h-4 w-4 text-muted-foreground" />
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-medium truncate">{invitation.invitee_email}</div>
+        <div className="flex items-center gap-1 text-xs text-muted-foreground">
+          <Clock className="h-3 w-3" />
+          <span>Pending</span>
+        </div>
+      </div>
+      {canManage && (
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          disabled={busy}
+          onClick={onRevoke}
+          title="Revoke invitation"
+        >
+          <X className="h-4 w-4 text-muted-foreground" />
+        </Button>
+      )}
+      <Badge variant="outline">
+        {rc.label}
+      </Badge>
+    </div>
+  );
+}
+
 export function MembersTab() {
   const user = useAuthStore((s) => s.user);
-  const workspace = useWorkspaceStore((s) => s.workspace);
+  const workspace = useCurrentWorkspace();
   const qc = useQueryClient();
   const wsId = useWorkspaceId();
   const { data: members = [] } = useQuery(memberListOptions(wsId));
+  const { data: invitations = [] } = useQuery(invitationListOptions(wsId));
 
   const [inviteEmail, setInviteEmail] = useState("");
   const [inviteRole, setInviteRole] = useState<MemberRole>("member");
   const [inviteLoading, setInviteLoading] = useState(false);
   const [memberActionId, setMemberActionId] = useState<string | null>(null);
+  const [invitationActionId, setInvitationActionId] = useState<string | null>(null);
   const [confirmAction, setConfirmAction] = useState<{
     title: string;
     description: string;
@@ -161,8 +226,9 @@ export function MembersTab() {
   const currentMember = members.find((m) => m.user_id === user?.id) ?? null;
   const canManageWorkspace = currentMember?.role === "owner" || currentMember?.role === "admin";
   const isOwner = currentMember?.role === "owner";
+  const ownerCount = members.filter((m) => m.role === "owner").length;
 
-  const handleAddMember = async () => {
+  const handleInviteMember = async () => {
     if (!workspace) return;
     setInviteLoading(true);
     try {
@@ -172,13 +238,34 @@ export function MembersTab() {
       });
       setInviteEmail("");
       setInviteRole("member");
-      qc.invalidateQueries({ queryKey: workspaceKeys.members(wsId) });
-      toast.success("Member added");
+      qc.invalidateQueries({ queryKey: workspaceKeys.invitations(wsId) });
+      toast.success("Invitation sent");
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "Failed to add member");
+      toast.error(e instanceof Error ? e.message : "Failed to send invitation");
     } finally {
       setInviteLoading(false);
     }
+  };
+
+  const handleRevokeInvitation = (invitation: Invitation) => {
+    if (!workspace) return;
+    setConfirmAction({
+      title: "Revoke invitation",
+      description: `Revoke the invitation to ${invitation.invitee_email}? They will no longer be able to join this workspace.`,
+      variant: "destructive",
+      onConfirm: async () => {
+        setInvitationActionId(invitation.id);
+        try {
+          await api.revokeInvitation(workspace.id, invitation.id);
+          qc.invalidateQueries({ queryKey: workspaceKeys.invitations(wsId) });
+          toast.success("Invitation revoked");
+        } catch (e) {
+          toast.error(e instanceof Error ? e.message : "Failed to revoke invitation");
+        } finally {
+          setInvitationActionId(null);
+        }
+      },
+    });
   };
 
   const handleRoleChange = async (memberId: string, role: MemberRole) => {
@@ -231,7 +318,7 @@ export function MembersTab() {
             <CardContent className="space-y-3">
               <div className="flex items-center gap-2">
                 <Plus className="h-4 w-4 text-muted-foreground" />
-                <h3 className="text-sm font-medium">Add member</h3>
+                <h3 className="text-sm font-medium">Invite member</h3>
               </div>
               <div className="grid gap-3 sm:grid-cols-[1fr_120px_auto]">
                 <Input
@@ -239,20 +326,24 @@ export function MembersTab() {
                   value={inviteEmail}
                   onChange={(e) => setInviteEmail(e.target.value)}
                   placeholder="user@company.com"
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && inviteEmail.trim()) handleInviteMember();
+                  }}
                 />
                 <Select value={inviteRole} onValueChange={(value) => setInviteRole(value as MemberRole)}>
-                  <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                  <SelectTrigger size="sm">
+                    <SelectValue>{() => roleConfig[inviteRole].label}</SelectValue>
+                  </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="member">Member</SelectItem>
-                    <SelectItem value="admin">Admin</SelectItem>
-                    {isOwner && <SelectItem value="owner">Owner</SelectItem>}
+                    <SelectItem value="member">{roleConfig.member.label}</SelectItem>
+                    <SelectItem value="admin">{roleConfig.admin.label}</SelectItem>
                   </SelectContent>
                 </Select>
                 <Button
-                  onClick={handleAddMember}
+                  onClick={handleInviteMember}
                   disabled={inviteLoading || !inviteEmail.trim()}
                 >
-                  {inviteLoading ? "Adding..." : "Add"}
+                  {inviteLoading ? "Inviting..." : "Invite"}
                 </Button>
               </div>
             </CardContent>
@@ -267,6 +358,7 @@ export function MembersTab() {
                   member={m}
                   canManage={canManageWorkspace}
                   canManageOwners={isOwner}
+                  ownerCount={ownerCount}
                   isSelf={m.user_id === user?.id}
                   busy={memberActionId === m.id}
                   onRoleChange={(role) => handleRoleChange(m.id, role)}
@@ -279,6 +371,27 @@ export function MembersTab() {
           <p className="text-sm text-muted-foreground">No members found.</p>
         )}
       </section>
+
+      {invitations.length > 0 && (
+        <section className="space-y-4">
+          <div className="flex items-center gap-2">
+            <Clock className="h-4 w-4 text-muted-foreground" />
+            <h2 className="text-sm font-semibold">Pending invitations ({invitations.length})</h2>
+          </div>
+          <div className="overflow-hidden rounded-xl ring-1 ring-foreground/10">
+            {invitations.map((inv, i) => (
+              <div key={inv.id} className={i > 0 ? "border-t border-border/50" : ""}>
+                <InvitationRow
+                  invitation={inv}
+                  canManage={canManageWorkspace}
+                  onRevoke={() => handleRevokeInvitation(inv)}
+                  busy={invitationActionId === inv.id}
+                />
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
 
       <AlertDialog open={!!confirmAction} onOpenChange={(v) => { if (!v) setConfirmAction(null); }}>
         <AlertDialogContent>

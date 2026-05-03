@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 // Directories to symlink from the shared ~/.codex/ into the per-task CODEX_HOME.
@@ -30,10 +29,33 @@ var codexCopiedFiles = []string{
 	"instructions.md",
 }
 
-// prepareCodexHome creates a per-task CODEX_HOME directory and seeds it with
-// config from the shared ~/.codex/ home. Auth is symlinked (shared), config
-// files are copied (isolated).
+// CodexHomeOptions carries optional inputs for prepareCodexHomeWithOpts that
+// affect the generated per-task config.toml.
+type CodexHomeOptions struct {
+	// CodexVersion is the detected Codex CLI version (e.g. "0.121.0"). Empty
+	// means unknown; on macOS, unknown is treated as "probably broken" so the
+	// daemon falls back to danger-full-access for network access. See
+	// codex_sandbox.go for details.
+	CodexVersion string
+	// GOOS overrides the target platform when deciding the sandbox policy.
+	// Empty means use runtime.GOOS. Primarily exists so tests can exercise
+	// both macOS and Linux paths deterministically.
+	GOOS string
+}
+
+// prepareCodexHome is a thin wrapper around prepareCodexHomeWithOpts kept for
+// tests that don't care about platform-aware sandbox configuration. It
+// assumes a Linux-like environment where workspace-write + network_access
+// works correctly.
 func prepareCodexHome(codexHome string, logger *slog.Logger) error {
+	return prepareCodexHomeWithOpts(codexHome, CodexHomeOptions{GOOS: "linux"}, logger)
+}
+
+// prepareCodexHomeWithOpts creates a per-task CODEX_HOME directory and seeds
+// it with config from the shared ~/.codex/ home. Auth is symlinked (shared),
+// config files are copied (isolated). The per-task config.toml gets a
+// daemon-managed sandbox block picked by codexSandboxPolicyFor.
+func prepareCodexHomeWithOpts(codexHome string, opts CodexHomeOptions, logger *slog.Logger) error {
 	sharedHome := resolveSharedCodexHome()
 
 	if err := os.MkdirAll(codexHome, 0o755); err != nil {
@@ -67,10 +89,34 @@ func prepareCodexHome(codexHome string, logger *slog.Logger) error {
 		}
 	}
 
-	// Ensure config.toml has workspace-write sandbox with network access enabled.
-	// Codex needs network access to reach the Multica API (api.multica.ai).
-	if err := ensureCodexNetworkAccess(filepath.Join(codexHome, "config.toml")); err != nil {
-		logger.Warn("execenv: codex-home ensure network access failed", "error", err)
+	// Drop `[[skills.config]]` entries inherited from the user's
+	// ~/.codex/config.toml. Codex Desktop writes plugin-backed skills with a
+	// `name` and no `path`, which the CLI's stricter TOML parser rejects with
+	// `missing field path` and bails out of `thread/start`. Multica writes the
+	// agent's active skills directly to `codex-home/skills/`, so the
+	// user-level registry is redundant here. See codex_skill_strip.go.
+	if err := sanitizeCopiedCodexConfig(filepath.Join(codexHome, "config.toml")); err != nil {
+		logger.Warn("execenv: codex-home sanitize config failed", "error", err)
+	}
+
+	if err := exposeSharedCodexPluginCache(codexHome, sharedHome); err != nil {
+		logger.Warn("execenv: codex-home plugin cache exposure failed", "error", err)
+	}
+
+	// Write a daemon-managed sandbox block into config.toml. On macOS we may
+	// need to fall back to danger-full-access because of openai/codex#10390;
+	// see codex_sandbox.go for the full rationale.
+	policy := codexSandboxPolicyFor(opts.GOOS, opts.CodexVersion)
+	if err := ensureCodexSandboxConfig(filepath.Join(codexHome, "config.toml"), policy, opts.CodexVersion, logger); err != nil {
+		logger.Warn("execenv: codex-home ensure sandbox config failed", "error", err)
+	}
+
+	// Disable Codex native multi-agent inside daemon-managed task sessions
+	// so the parent thread's `turn/completed` is not interpreted as task
+	// completion while spawned subagents are still running. See
+	// codex_multi_agent.go for the full rationale and escape hatch.
+	if err := ensureCodexMultiAgentConfig(filepath.Join(codexHome, "config.toml"), logger); err != nil {
+		logger.Warn("execenv: codex-home ensure multi-agent config failed", "error", err)
 	}
 
 	return nil
@@ -90,6 +136,38 @@ func resolveSharedCodexHome() string {
 		return filepath.Join(os.TempDir(), ".codex") // last resort fallback
 	}
 	return filepath.Join(home, ".codex")
+}
+
+func exposeSharedCodexPluginCache(codexHome, sharedHome string) error {
+	src := filepath.Join(sharedHome, "plugins", "cache")
+	dst := filepath.Join(codexHome, "plugins", "cache")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		return fmt.Errorf("create shared plugin cache dir: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return fmt.Errorf("create codex plugin dir: %w", err)
+	}
+
+	if fi, err := os.Lstat(dst); err == nil {
+		isLink := fi.Mode()&os.ModeSymlink != 0
+		if isLink {
+			if target, readlinkErr := os.Readlink(dst); readlinkErr == nil && target == src {
+				return nil
+			}
+			if err := os.Remove(dst); err != nil {
+				return fmt.Errorf("remove stale plugin cache link: %w", err)
+			}
+		} else {
+			if err := os.RemoveAll(dst); err != nil {
+				return fmt.Errorf("remove stale plugin cache path: %w", err)
+			}
+		}
+	}
+
+	if err := createDirLink(src, dst); err != nil {
+		return fmt.Errorf("expose shared plugin cache: %w", err)
+	}
+	return nil
 }
 
 // ensureDirSymlink creates a symlink dst → src for a directory.
@@ -144,53 +222,10 @@ func ensureSymlink(src, dst string) error {
 	return createFileLink(src, dst)
 }
 
-// defaultCodexConfig is the minimal config.toml for Codex tasks.
-// It sets workspace-write sandbox mode with network access enabled so the
-// Multica CLI can reach api.multica.ai.
-const defaultCodexConfig = `sandbox_mode = "workspace-write"
-
-[sandbox_workspace_write]
-network_access = true
-`
-
-// ensureCodexNetworkAccess ensures that config.toml exists and contains the
-// sandbox_workspace_write section with network_access = true. If the file
-// doesn't exist, it creates one with defaults. If it exists but lacks the
-// network_access setting, the section is appended.
-func ensureCodexNetworkAccess(configPath string) error {
-	data, err := os.ReadFile(configPath)
-	if os.IsNotExist(err) {
-		// No config.toml — create with defaults.
-		return os.WriteFile(configPath, []byte(defaultCodexConfig), 0o644)
-	}
-	if err != nil {
-		return fmt.Errorf("read config.toml: %w", err)
-	}
-
-	content := string(data)
-
-	// If the file already has network_access configured under sandbox_workspace_write, leave it alone.
-	if strings.Contains(content, "[sandbox_workspace_write]") && strings.Contains(content, "network_access") {
-		return nil
-	}
-
-	// Append the section. If sandbox_mode is already set, only append the section block.
-	var appendStr string
-	if strings.Contains(content, "[sandbox_workspace_write]") {
-		// Section exists but missing network_access — append the key under it.
-		content = strings.Replace(content, "[sandbox_workspace_write]", "[sandbox_workspace_write]\nnetwork_access = true", 1)
-		return os.WriteFile(configPath, []byte(content), 0o644)
-	}
-
-	// Section doesn't exist — append both sandbox_mode (if missing) and the section.
-	appendStr = "\n"
-	if !strings.Contains(content, "sandbox_mode") {
-		appendStr += "sandbox_mode = \"workspace-write\"\n"
-	}
-	appendStr += "\n[sandbox_workspace_write]\nnetwork_access = true\n"
-
-	return os.WriteFile(configPath, append(data, []byte(appendStr)...), 0o644)
-}
+// (The daemon used to write a minimal inline config here; the authoritative
+// sandbox/network directives now live in a managed block rendered by
+// codex_sandbox.go's ensureCodexSandboxConfig so they can be updated
+// idempotently without touching user-managed keys.)
 
 // copyFileIfExists copies src to dst. If src doesn't exist, it's a no-op.
 // If dst already exists, it's not overwritten.

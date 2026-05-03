@@ -35,11 +35,19 @@ func (h *Handler) CreateChatSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "agent_id is required")
 		return
 	}
+	agentID, ok := parseUUIDOrBadRequest(w, req.AgentID, "agent_id")
+	if !ok {
+		return
+	}
+	workspaceUUID, ok := parseUUIDOrBadRequest(w, workspaceID, "workspace id")
+	if !ok {
+		return
+	}
 
 	// Verify agent exists in workspace.
 	agent, err := h.Queries.GetAgentInWorkspace(r.Context(), db.GetAgentInWorkspaceParams{
-		ID:          parseUUID(req.AgentID),
-		WorkspaceID: parseUUID(workspaceID),
+		ID:          agentID,
+		WorkspaceID: workspaceUUID,
 	})
 	if err != nil {
 		writeError(w, http.StatusNotFound, "agent not found")
@@ -51,8 +59,8 @@ func (h *Handler) CreateChatSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	session, err := h.Queries.CreateChatSession(r.Context(), db.CreateChatSessionParams{
-		WorkspaceID: parseUUID(workspaceID),
-		AgentID:     parseUUID(req.AgentID),
+		WorkspaceID: workspaceUUID,
+		AgentID:     agentID,
 		CreatorID:   parseUUID(userID),
 		Title:       req.Title,
 	})
@@ -73,29 +81,81 @@ func (h *Handler) ListChatSessions(w http.ResponseWriter, r *http.Request) {
 
 	status := r.URL.Query().Get("status")
 
-	var sessions []db.ChatSession
-	var err error
+	// Two call sites → two row types with identical shape. Collect into a
+	// common response slice via small per-branch loops.
+	var resp []ChatSessionResponse
 	if status == "all" {
-		sessions, err = h.Queries.ListAllChatSessionsByCreator(r.Context(), db.ListAllChatSessionsByCreatorParams{
+		rows, err := h.Queries.ListAllChatSessionsByCreator(r.Context(), db.ListAllChatSessionsByCreatorParams{
 			WorkspaceID: parseUUID(workspaceID),
 			CreatorID:   parseUUID(userID),
 		})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to list chat sessions")
+			return
+		}
+		resp = make([]ChatSessionResponse, len(rows))
+		for i, s := range rows {
+			resp[i] = ChatSessionResponse{
+				ID:          uuidToString(s.ID),
+				WorkspaceID: uuidToString(s.WorkspaceID),
+				AgentID:     uuidToString(s.AgentID),
+				CreatorID:   uuidToString(s.CreatorID),
+				Title:       s.Title,
+				Status:      s.Status,
+				HasUnread:   s.HasUnread,
+				CreatedAt:   timestampToString(s.CreatedAt),
+				UpdatedAt:   timestampToString(s.UpdatedAt),
+			}
+		}
 	} else {
-		sessions, err = h.Queries.ListChatSessionsByCreator(r.Context(), db.ListChatSessionsByCreatorParams{
+		rows, err := h.Queries.ListChatSessionsByCreator(r.Context(), db.ListChatSessionsByCreatorParams{
 			WorkspaceID: parseUUID(workspaceID),
 			CreatorID:   parseUUID(userID),
 		})
-	}
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to list chat sessions")
-		return
-	}
-
-	resp := make([]ChatSessionResponse, len(sessions))
-	for i, s := range sessions {
-		resp[i] = chatSessionToResponse(s)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to list chat sessions")
+			return
+		}
+		resp = make([]ChatSessionResponse, len(rows))
+		for i, s := range rows {
+			resp[i] = ChatSessionResponse{
+				ID:          uuidToString(s.ID),
+				WorkspaceID: uuidToString(s.WorkspaceID),
+				AgentID:     uuidToString(s.AgentID),
+				CreatorID:   uuidToString(s.CreatorID),
+				Title:       s.Title,
+				Status:      s.Status,
+				HasUnread:   s.HasUnread,
+				CreatedAt:   timestampToString(s.CreatedAt),
+				UpdatedAt:   timestampToString(s.UpdatedAt),
+			}
+		}
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (h *Handler) loadChatSessionForUser(w http.ResponseWriter, r *http.Request, userID, workspaceID, sessionID string) (db.ChatSession, bool) {
+	sessionUUID, ok := parseUUIDOrBadRequest(w, sessionID, "chat session id")
+	if !ok {
+		return db.ChatSession{}, false
+	}
+	workspaceUUID, ok := parseUUIDOrBadRequest(w, workspaceID, "workspace id")
+	if !ok {
+		return db.ChatSession{}, false
+	}
+	session, err := h.Queries.GetChatSessionInWorkspace(r.Context(), db.GetChatSessionInWorkspaceParams{
+		ID:          sessionUUID,
+		WorkspaceID: workspaceUUID,
+	})
+	if err != nil {
+		writeError(w, http.StatusNotFound, "chat session not found")
+		return db.ChatSession{}, false
+	}
+	if uuidToString(session.CreatorID) != userID {
+		writeError(w, http.StatusForbidden, "not your chat session")
+		return db.ChatSession{}, false
+	}
+	return session, true
 }
 
 func (h *Handler) GetChatSession(w http.ResponseWriter, r *http.Request) {
@@ -106,16 +166,8 @@ func (h *Handler) GetChatSession(w http.ResponseWriter, r *http.Request) {
 	workspaceID := ctxWorkspaceID(r.Context())
 	sessionID := chi.URLParam(r, "sessionId")
 
-	session, err := h.Queries.GetChatSessionInWorkspace(r.Context(), db.GetChatSessionInWorkspaceParams{
-		ID:          parseUUID(sessionID),
-		WorkspaceID: parseUUID(workspaceID),
-	})
-	if err != nil {
-		writeError(w, http.StatusNotFound, "chat session not found")
-		return
-	}
-	if uuidToString(session.CreatorID) != userID {
-		writeError(w, http.StatusForbidden, "not your chat session")
+	session, ok := h.loadChatSessionForUser(w, r, userID, workspaceID, sessionID)
+	if !ok {
 		return
 	}
 
@@ -130,20 +182,12 @@ func (h *Handler) ArchiveChatSession(w http.ResponseWriter, r *http.Request) {
 	workspaceID := ctxWorkspaceID(r.Context())
 	sessionID := chi.URLParam(r, "sessionId")
 
-	session, err := h.Queries.GetChatSessionInWorkspace(r.Context(), db.GetChatSessionInWorkspaceParams{
-		ID:          parseUUID(sessionID),
-		WorkspaceID: parseUUID(workspaceID),
-	})
-	if err != nil {
-		writeError(w, http.StatusNotFound, "chat session not found")
-		return
-	}
-	if uuidToString(session.CreatorID) != userID {
-		writeError(w, http.StatusForbidden, "not your chat session")
+	session, ok := h.loadChatSessionForUser(w, r, userID, workspaceID, sessionID)
+	if !ok {
 		return
 	}
 
-	if err := h.Queries.ArchiveChatSession(r.Context(), parseUUID(sessionID)); err != nil {
+	if err := h.Queries.ArchiveChatSession(r.Context(), session.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to archive chat session")
 		return
 	}
@@ -162,6 +206,12 @@ type SendChatMessageRequest struct {
 type SendChatMessageResponse struct {
 	MessageID string `json:"message_id"`
 	TaskID    string `json:"task_id"`
+	// CreatedAt anchors the chat StatusPill timer the instant the user
+	// hits send. Without it the front-end falls back to its local clock
+	// and the timer "snaps backwards" later when WS events deliver the
+	// real created_at. Returning it here means the pill renders 0s from
+	// the start with a stable anchor.
+	CreatedAt string `json:"created_at"`
 }
 
 func (h *Handler) SendChatMessage(w http.ResponseWriter, r *http.Request) {
@@ -183,20 +233,12 @@ func (h *Handler) SendChatMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Load chat session.
-	session, err := h.Queries.GetChatSessionInWorkspace(r.Context(), db.GetChatSessionInWorkspaceParams{
-		ID:          parseUUID(sessionID),
-		WorkspaceID: parseUUID(workspaceID),
-	})
-	if err != nil {
-		writeError(w, http.StatusNotFound, "chat session not found")
+	session, ok := h.loadChatSessionForUser(w, r, userID, workspaceID, sessionID)
+	if !ok {
 		return
 	}
 	if session.Status != "active" {
 		writeError(w, http.StatusBadRequest, "chat session is archived")
-		return
-	}
-	if uuidToString(session.CreatorID) != userID {
-		writeError(w, http.StatusForbidden, "not your chat session")
 		return
 	}
 
@@ -224,8 +266,9 @@ func (h *Handler) SendChatMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Broadcast the user message.
-	h.publish(protocol.EventChatMessage, workspaceID, "member", userID, protocol.ChatMessagePayload{
-		ChatSessionID: sessionID,
+	resolvedSessionID := uuidToString(session.ID)
+	h.publishChat(protocol.EventChatMessage, workspaceID, "member", userID, resolvedSessionID, protocol.ChatMessagePayload{
+		ChatSessionID: resolvedSessionID,
 		MessageID:     uuidToString(msg.ID),
 		Role:          "user",
 		Content:       req.Content,
@@ -236,6 +279,7 @@ func (h *Handler) SendChatMessage(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, SendChatMessageResponse{
 		MessageID: uuidToString(msg.ID),
 		TaskID:    uuidToString(task.ID),
+		CreatedAt: timestampToString(task.CreatedAt),
 	})
 }
 
@@ -247,20 +291,12 @@ func (h *Handler) ListChatMessages(w http.ResponseWriter, r *http.Request) {
 	workspaceID := ctxWorkspaceID(r.Context())
 	sessionID := chi.URLParam(r, "sessionId")
 
-	session, err := h.Queries.GetChatSessionInWorkspace(r.Context(), db.GetChatSessionInWorkspaceParams{
-		ID:          parseUUID(sessionID),
-		WorkspaceID: parseUUID(workspaceID),
-	})
-	if err != nil {
-		writeError(w, http.StatusNotFound, "chat session not found")
-		return
-	}
-	if uuidToString(session.CreatorID) != userID {
-		writeError(w, http.StatusForbidden, "not your chat session")
+	session, ok := h.loadChatSessionForUser(w, r, userID, workspaceID, sessionID)
+	if !ok {
 		return
 	}
 
-	messages, err := h.Queries.ListChatMessages(r.Context(), parseUUID(sessionID))
+	messages, err := h.Queries.ListChatMessages(r.Context(), session.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list chat messages")
 		return
@@ -271,6 +307,118 @@ func (h *Handler) ListChatMessages(w http.ResponseWriter, r *http.Request) {
 		resp[i] = chatMessageToResponse(m)
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// PendingChatTaskResponse is returned by GetPendingChatTask — either the
+// current in-flight task's id/status, or an empty object when none is active.
+// CreatedAt is the anchor the frontend uses to time the chat StatusPill
+// (elapsed seconds = now - CreatedAt). It must come from the server because
+// optimistic seeds don't have a real task created_at and the timer needs to
+// survive refresh / reopen.
+type PendingChatTaskResponse struct {
+	TaskID    string `json:"task_id,omitempty"`
+	Status    string `json:"status,omitempty"`
+	CreatedAt string `json:"created_at,omitempty"`
+}
+
+// MarkChatSessionRead clears the session's unread_since (→ has_unread=false)
+// and broadcasts chat:session_read so other devices of the same user drop
+// their badges.
+func (h *Handler) MarkChatSessionRead(w http.ResponseWriter, r *http.Request) {
+	userID, ok := requireUserID(w, r)
+	if !ok {
+		return
+	}
+	workspaceID := ctxWorkspaceID(r.Context())
+	sessionID := chi.URLParam(r, "sessionId")
+
+	session, ok := h.loadChatSessionForUser(w, r, userID, workspaceID, sessionID)
+	if !ok {
+		return
+	}
+
+	if err := h.Queries.MarkChatSessionRead(r.Context(), session.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to mark session read")
+		return
+	}
+
+	resolvedSessionID := uuidToString(session.ID)
+	h.publishChat(protocol.EventChatSessionRead, workspaceID, "member", userID, resolvedSessionID, protocol.ChatSessionReadPayload{
+		ChatSessionID: resolvedSessionID,
+	})
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// PendingChatTasksResponse is the aggregate view consumed by the FAB.
+type PendingChatTasksResponse struct {
+	Tasks []PendingChatTaskItem `json:"tasks"`
+}
+
+type PendingChatTaskItem struct {
+	TaskID        string `json:"task_id"`
+	Status        string `json:"status"`
+	ChatSessionID string `json:"chat_session_id"`
+}
+
+// ListPendingChatTasks returns every in-flight chat task owned by the current
+// user in this workspace. Drives the FAB's "running" indicator when the chat
+// window is closed (no per-session query is subscribed).
+func (h *Handler) ListPendingChatTasks(w http.ResponseWriter, r *http.Request) {
+	userID, ok := requireUserID(w, r)
+	if !ok {
+		return
+	}
+	workspaceID := ctxWorkspaceID(r.Context())
+
+	rows, err := h.Queries.ListPendingChatTasksByCreator(r.Context(), db.ListPendingChatTasksByCreatorParams{
+		WorkspaceID: parseUUID(workspaceID),
+		CreatorID:   parseUUID(userID),
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list pending chat tasks")
+		return
+	}
+
+	items := make([]PendingChatTaskItem, len(rows))
+	for i, row := range rows {
+		items[i] = PendingChatTaskItem{
+			TaskID:        uuidToString(row.TaskID),
+			Status:        row.Status,
+			ChatSessionID: uuidToString(row.ChatSessionID),
+		}
+	}
+	writeJSON(w, http.StatusOK, PendingChatTasksResponse{Tasks: items})
+}
+
+// GetPendingChatTask returns the most recent in-flight task (queued / dispatched
+// / running) for a chat session. The frontend polls this on mount / session
+// switch so pending UI state survives refresh and reopen.
+func (h *Handler) GetPendingChatTask(w http.ResponseWriter, r *http.Request) {
+	userID, ok := requireUserID(w, r)
+	if !ok {
+		return
+	}
+	workspaceID := ctxWorkspaceID(r.Context())
+	sessionID := chi.URLParam(r, "sessionId")
+
+	session, ok := h.loadChatSessionForUser(w, r, userID, workspaceID, sessionID)
+	if !ok {
+		return
+	}
+
+	task, err := h.Queries.GetPendingChatTask(r.Context(), session.ID)
+	if err != nil {
+		// No in-flight task — return an empty object, not an error.
+		writeJSON(w, http.StatusOK, PendingChatTaskResponse{})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, PendingChatTaskResponse{
+		TaskID:    uuidToString(task.ID),
+		Status:    task.Status,
+		CreatedAt: timestampToString(task.CreatedAt),
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -286,8 +434,12 @@ func (h *Handler) CancelTaskByUser(w http.ResponseWriter, r *http.Request) {
 	}
 	workspaceID := ctxWorkspaceID(r.Context())
 	taskID := chi.URLParam(r, "taskId")
+	taskUUID, ok := parseUUIDOrBadRequest(w, taskID, "task id")
+	if !ok {
+		return
+	}
 
-	task, err := h.Queries.GetAgentTask(r.Context(), parseUUID(taskID))
+	task, err := h.Queries.GetAgentTask(r.Context(), taskUUID)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "task not found")
 		return
@@ -319,7 +471,7 @@ func (h *Handler) CancelTaskByUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cancelled, err := h.TaskService.CancelTask(r.Context(), parseUUID(taskID))
+	cancelled, err := h.TaskService.CancelTask(r.Context(), taskUUID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -333,14 +485,16 @@ func (h *Handler) CancelTaskByUser(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 
 type ChatSessionResponse struct {
-	ID          string  `json:"id"`
-	WorkspaceID string  `json:"workspace_id"`
-	AgentID     string  `json:"agent_id"`
-	CreatorID   string  `json:"creator_id"`
-	Title       string  `json:"title"`
-	Status      string  `json:"status"`
-	CreatedAt   string  `json:"created_at"`
-	UpdatedAt   string  `json:"updated_at"`
+	ID          string `json:"id"`
+	WorkspaceID string `json:"workspace_id"`
+	AgentID     string `json:"agent_id"`
+	CreatorID   string `json:"creator_id"`
+	Title       string `json:"title"`
+	Status      string `json:"status"`
+	// Only populated by list endpoints — single-session fetches return false.
+	HasUnread bool   `json:"has_unread"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
 }
 
 type ChatMessageResponse struct {
@@ -350,6 +504,12 @@ type ChatMessageResponse struct {
 	Content       string  `json:"content"`
 	TaskID        *string `json:"task_id"`
 	CreatedAt     string  `json:"created_at"`
+	// FailureReason flags an assistant row synthesized by FailTask's chat
+	// fallback. Front-end uses it to switch to the destructive bubble.
+	FailureReason *string `json:"failure_reason"`
+	// ElapsedMs is the wall-clock duration from task creation to terminal
+	// state. Drives "Replied in 38s" / "Failed after 12s" captions.
+	ElapsedMs *int64 `json:"elapsed_ms"`
 }
 
 func chatSessionToResponse(s db.ChatSession) ChatSessionResponse {
@@ -373,5 +533,7 @@ func chatMessageToResponse(m db.ChatMessage) ChatMessageResponse {
 		Content:       m.Content,
 		TaskID:        uuidToPtr(m.TaskID),
 		CreatedAt:     timestampToString(m.CreatedAt),
+		FailureReason: textToPtr(m.FailureReason),
+		ElapsedMs:     int8ToPtr(m.ElapsedMs),
 	}
 }

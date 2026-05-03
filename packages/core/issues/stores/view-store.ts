@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useRef } from "react";
 import { create } from "zustand";
 import { createStore, type StoreApi } from "zustand/vanilla";
 import { createJSONStorage, persist } from "zustand/middleware";
@@ -17,6 +18,9 @@ export interface CardProperties {
   description: boolean;
   assignee: boolean;
   dueDate: boolean;
+  project: boolean;
+  childProgress: boolean;
+  labels: boolean;
 }
 
 export interface ActorFilterValue {
@@ -37,6 +41,9 @@ export const CARD_PROPERTY_OPTIONS: { key: keyof CardProperties; label: string }
   { key: "description", label: "Description" },
   { key: "assignee", label: "Assignee" },
   { key: "dueDate", label: "Due date" },
+  { key: "project", label: "Project" },
+  { key: "labels", label: "Labels" },
+  { key: "childProgress", label: "Sub-issue progress" },
 ];
 
 export interface IssueViewState {
@@ -48,6 +55,7 @@ export interface IssueViewState {
   creatorFilters: ActorFilterValue[];
   projectFilters: string[];
   includeNoProject: boolean;
+  labelFilters: string[];
   sortBy: SortField;
   sortDirection: SortDirection;
   cardProperties: CardProperties;
@@ -60,6 +68,7 @@ export interface IssueViewState {
   toggleCreatorFilter: (value: ActorFilterValue) => void;
   toggleProjectFilter: (projectId: string) => void;
   toggleNoProject: () => void;
+  toggleLabelFilter: (labelId: string) => void;
   hideStatus: (status: IssueStatus) => void;
   showStatus: (status: IssueStatus) => void;
   clearFilters: () => void;
@@ -78,6 +87,7 @@ export const viewStoreSlice = (set: StoreApi<IssueViewState>["setState"]): Issue
   creatorFilters: [],
   projectFilters: [],
   includeNoProject: false,
+  labelFilters: [],
   sortBy: "position",
   sortDirection: "asc",
   cardProperties: {
@@ -85,6 +95,9 @@ export const viewStoreSlice = (set: StoreApi<IssueViewState>["setState"]): Issue
     description: true,
     assignee: true,
     dueDate: true,
+    project: true,
+    childProgress: true,
+    labels: true,
   },
   listCollapsedStatuses: [],
 
@@ -137,6 +150,12 @@ export const viewStoreSlice = (set: StoreApi<IssueViewState>["setState"]): Issue
     })),
   toggleNoProject: () =>
     set((state) => ({ includeNoProject: !state.includeNoProject })),
+  toggleLabelFilter: (labelId) =>
+    set((state) => ({
+      labelFilters: state.labelFilters.includes(labelId)
+        ? state.labelFilters.filter((id) => id !== labelId)
+        : [...state.labelFilters, labelId],
+    })),
   hideStatus: (status) =>
     set((state) => {
       // If no filter active, activate filter with all EXCEPT this one
@@ -162,6 +181,7 @@ export const viewStoreSlice = (set: StoreApi<IssueViewState>["setState"]): Issue
       creatorFilters: [],
       projectFilters: [],
       includeNoProject: false,
+      labelFilters: [],
     }),
   setSortBy: (field) => set({ sortBy: field }),
   setSortDirection: (dir) => set({ sortDirection: dir }),
@@ -192,12 +212,39 @@ export const viewStorePersistOptions = (name: string) => ({
     creatorFilters: state.creatorFilters,
     projectFilters: state.projectFilters,
     includeNoProject: state.includeNoProject,
+    labelFilters: state.labelFilters,
     sortBy: state.sortBy,
     sortDirection: state.sortDirection,
     cardProperties: state.cardProperties,
     listCollapsedStatuses: state.listCollapsedStatuses,
   }),
+  // Default Zustand merge is shallow, so a persisted `cardProperties` snapshot
+  // saved before a new toggle was introduced wins entirely and the new key is
+  // missing — the dropdown switch then reads `undefined` and renders unchecked
+  // even though defaults treat it as on. Deep-merge `cardProperties` so newly
+  // added toggles inherit their default value for existing users.
+  merge: mergeViewStatePersisted,
 });
+
+/**
+ * Reusable persist `merge` for view-state stores. Generic over T so the same
+ * deep-merge for `cardProperties` works for both the issues view store and
+ * the my-issues view store (which extends IssueViewState).
+ */
+export function mergeViewStatePersisted<T extends IssueViewState>(
+  persisted: unknown,
+  current: T,
+): T {
+  const p = (persisted ?? {}) as Partial<T>;
+  return {
+    ...current,
+    ...p,
+    cardProperties: {
+      ...current.cardProperties,
+      ...(p.cardProperties ?? {}),
+    },
+  };
+}
 
 /** Factory: creates a vanilla StoreApi for use with React Context. */
 export function createIssueViewStore(persistKey: string): StoreApi<IssueViewState> {
@@ -215,43 +262,23 @@ export const useIssueViewStore = create<IssueViewState>()(
 
 registerForWorkspaceRehydration(() => useIssueViewStore.persist.rehydrate());
 
-// Clear filters on all registered view stores when workspace switches.
-const _syncedStores = new Set<StoreApi<IssueViewState>>();
-let _workspaceSyncInitialized = false;
-
 /**
- * Register a view store to clear filters on workspace switch.
+ * Clears the given view store's filters whenever the workspace id changes.
  *
- * @param store - The view store to register.
- * @param subscribeToWorkspace - Optional: a function that subscribes to workspace
- *   changes and calls the callback with the new workspace ID. The app layer should
- *   provide this to avoid a circular dependency on the workspace store.
- *   Example: `(cb) => useWorkspaceStore.subscribe(s => cb(s.workspace?.id))`
+ * URL-driven: wsId arrives from `useWorkspaceId()` (Context fed by the
+ * `[workspaceSlug]` route). We track the previous id via ref so the first
+ * render doesn't wipe persisted filters — clearing only fires on transitions
+ * from one defined workspace to another.
  */
-export function registerViewStoreForWorkspaceSync(
-  store: StoreApi<IssueViewState>,
-  subscribeToWorkspace?: (callback: (workspaceId: string | undefined) => void) => void,
+export function useClearFiltersOnWorkspaceChange(
+  store: StoreApi<IssueViewState> | { getState: () => IssueViewState },
+  wsId: string | undefined,
 ) {
-  _syncedStores.add(store);
-  if (_workspaceSyncInitialized) return;
-  _workspaceSyncInitialized = true;
-
-  if (subscribeToWorkspace) {
-    let prevId: string | undefined;
-    subscribeToWorkspace((id) => {
-      if (prevId && id !== prevId) {
-        for (const s of _syncedStores) s.getState().clearFilters();
-      }
-      prevId = id;
-    });
-  }
-  // TODO: If no subscribeToWorkspace is provided, the workspace sync is a no-op.
-  // The app layer (apps/web) should call this with the workspace store subscription
-  // to wire up filter clearing on workspace switch.
+  const prevIdRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (prevIdRef.current && wsId && wsId !== prevIdRef.current) {
+      store.getState().clearFilters();
+    }
+    prevIdRef.current = wsId;
+  }, [wsId, store]);
 }
-
-/** Backward-compatible alias — registers the global singleton for workspace sync. */
-export const initFilterWorkspaceSync = (
-  subscribeToWorkspace?: (callback: (workspaceId: string | undefined) => void) => void,
-) =>
-  registerViewStoreForWorkspaceSync(useIssueViewStore, subscribeToWorkspace);

@@ -5,21 +5,35 @@ import {
   useCallback,
   useEffect,
   useImperativeHandle,
+  useMemo,
   useRef,
   useState,
 } from "react";
 import { ReactRenderer } from "@tiptap/react";
 import { computePosition, offset, flip, shift } from "@floating-ui/dom";
 import type { QueryClient } from "@tanstack/react-query";
-import { useWorkspaceStore } from "@multica/core/workspace";
-import { issueKeys } from "@multica/core/issues/queries";
+import { getCurrentWsId } from "@multica/core/platform";
+import { flattenIssueBuckets, issueKeys } from "@multica/core/issues/queries";
 import { workspaceKeys } from "@multica/core/workspace/queries";
-import type { Issue, ListIssuesResponse, MemberWithUser, Agent } from "@multica/core/types";
+import { useAuthStore } from "@multica/core/auth";
+import { canAssignAgentToIssue } from "@multica/core/permissions";
+import { api } from "@multica/core/api";
+import type {
+  Issue,
+  ListIssuesCache,
+  MemberWithUser,
+  Agent,
+} from "@multica/core/types";
 import { ActorAvatar } from "../../common/actor-avatar";
 import { StatusIcon } from "../../issues/components/status-icon";
 import { Badge } from "@multica/ui/components/ui/badge";
 import type { IssueStatus } from "@multica/core/types";
 import type { SuggestionOptions, SuggestionProps } from "@tiptap/suggestion";
+import {
+  getRecencyMap,
+  recordMentionUsage,
+  sortUserItemsByRecency,
+} from "./mention-recency";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -37,6 +51,7 @@ export interface MentionItem {
 
 interface MentionListProps {
   items: MentionItem[];
+  query: string;
   command: (item: MentionItem) => void;
 }
 
@@ -75,14 +90,100 @@ function groupItems(items: MentionItem[]): MentionGroup[] {
 // MentionList — the popup rendered inside the editor
 // ---------------------------------------------------------------------------
 
-const MentionList = forwardRef<MentionListRef, MentionListProps>(
-  function MentionList({ items, command }, ref) {
+const MAX_ITEMS = 20;
+const SERVER_ISSUE_SEARCH_LIMIT = 20;
+const SERVER_SEARCH_DEBOUNCE_MS = 150;
+
+function mentionItemKey(item: MentionItem): string {
+  return `${item.type}:${item.id}`;
+}
+
+function mergeMentionItems(
+  syncItems: MentionItem[],
+  serverIssueItems: MentionItem[],
+): MentionItem[] {
+  const seen = new Set<string>();
+  const merged: MentionItem[] = [];
+
+  for (const item of [...syncItems, ...serverIssueItems]) {
+    const key = mentionItemKey(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(item);
+  }
+
+  return merged;
+}
+
+export const MentionList = forwardRef<MentionListRef, MentionListProps>(
+  function MentionList({ items, query, command }, ref) {
     const [selectedIndex, setSelectedIndex] = useState(0);
+    const [serverIssueItems, setServerIssueItems] = useState<MentionItem[]>([]);
+    const [isSearchingIssues, setIsSearchingIssues] = useState(false);
+    const [searchedIssueQuery, setSearchedIssueQuery] = useState("");
     const itemRefs = useRef<(HTMLButtonElement | null)[]>([]);
+    const normalizedQuery = query.trim();
+
+    useEffect(() => {
+      const q = normalizedQuery;
+      setServerIssueItems([]);
+
+      if (!q) {
+        setIsSearchingIssues(false);
+        setSearchedIssueQuery("");
+        return;
+      }
+
+      const wsId = getCurrentWsId();
+      if (!wsId) {
+        setIsSearchingIssues(false);
+        setSearchedIssueQuery(q);
+        return;
+      }
+
+      let cancelled = false;
+      const controller = new AbortController();
+      setIsSearchingIssues(true);
+
+      const timer = setTimeout(() => {
+        void (async () => {
+          try {
+            const res = await api.searchIssues({
+              q,
+              limit: SERVER_ISSUE_SEARCH_LIMIT,
+              include_closed: true,
+              signal: controller.signal,
+            });
+            if (!cancelled && !controller.signal.aborted) {
+              setServerIssueItems(res.issues.map(issueToMention));
+            }
+          } catch {
+            // Aborted or network error: keep the synchronous cache results.
+          } finally {
+            if (!cancelled && !controller.signal.aborted) {
+              setSearchedIssueQuery(q);
+              setIsSearchingIssues(false);
+            }
+          }
+        })();
+      }, SERVER_SEARCH_DEBOUNCE_MS);
+
+      return () => {
+        cancelled = true;
+        clearTimeout(timer);
+        controller.abort();
+      };
+    }, [normalizedQuery]);
+
+    const displayItems = useMemo(() => {
+      const currentServerIssueItems =
+        searchedIssueQuery === normalizedQuery ? serverIssueItems : [];
+      return mergeMentionItems(items, currentServerIssueItems).slice(0, MAX_ITEMS);
+    }, [items, normalizedQuery, searchedIssueQuery, serverIssueItems]);
 
     useEffect(() => {
       setSelectedIndex(0);
-    }, [items]);
+    }, [displayItems]);
 
     useEffect(() => {
       itemRefs.current[selectedIndex]?.scrollIntoView({ block: "nearest" });
@@ -90,23 +191,31 @@ const MentionList = forwardRef<MentionListRef, MentionListProps>(
 
     const selectItem = useCallback(
       (index: number) => {
-        const item = items[index];
-        if (item) command(item);
+        const item = displayItems[index];
+        if (!item) return;
+        const wsId = getCurrentWsId();
+        if (wsId) recordMentionUsage(wsId, item);
+        command(item);
       },
-      [items, command],
+      [displayItems, command],
     );
 
     useImperativeHandle(ref, () => ({
       onKeyDown: ({ event }) => {
         if (event.key === "ArrowUp") {
-          setSelectedIndex((i) => (i + items.length - 1) % items.length);
+          if (displayItems.length === 0) return true;
+          setSelectedIndex(
+            (i) => (i + displayItems.length - 1) % displayItems.length,
+          );
           return true;
         }
         if (event.key === "ArrowDown") {
-          setSelectedIndex((i) => (i + 1) % items.length);
+          if (displayItems.length === 0) return true;
+          setSelectedIndex((i) => (i + 1) % displayItems.length);
           return true;
         }
         if (event.key === "Enter") {
+          if (displayItems.length === 0) return true;
           selectItem(selectedIndex);
           return true;
         }
@@ -114,15 +223,19 @@ const MentionList = forwardRef<MentionListRef, MentionListProps>(
       },
     }));
 
-    if (items.length === 0) {
+    if (displayItems.length === 0) {
+      const isWaitingForServer =
+        normalizedQuery !== "" &&
+        (isSearchingIssues || searchedIssueQuery !== normalizedQuery);
+
       return (
         <div className="rounded-md border bg-popover p-2 text-xs text-muted-foreground shadow-md">
-          No results
+          {isWaitingForServer ? "Searching..." : "No results"}
         </div>
       );
     }
 
-    const groups = groupItems(items);
+    const groups = groupItems(displayItems);
 
     // Build a flat index mapping: globalIndex → item
     let globalIndex = 0;
@@ -169,12 +282,15 @@ function MentionRow({
   buttonRef: (el: HTMLButtonElement | null) => void;
 }) {
   if (item.type === "issue") {
+    // Visually dim closed issues (done/cancelled) so they're distinguishable
+    // from active ones in the suggestion list — they're still selectable.
+    const isClosed = item.status === "done" || item.status === "cancelled";
     return (
       <button
         ref={buttonRef}
         className={`flex w-full items-center gap-2.5 px-3 py-1.5 text-left text-xs transition-colors ${
           selected ? "bg-accent" : "hover:bg-accent/50"
-        }`}
+        } ${isClosed ? "opacity-60" : ""}`}
         onClick={onSelect}
       >
         {item.status && (
@@ -182,7 +298,11 @@ function MentionRow({
         )}
         <span className="shrink-0 text-muted-foreground">{item.label}</span>
         {item.description && (
-          <span className="truncate text-muted-foreground">{item.description}</span>
+          <span
+            className={`truncate text-muted-foreground ${isClosed ? "line-through" : ""}`}
+          >
+            {item.description}
+          </span>
         )}
       </button>
     );
@@ -200,6 +320,7 @@ function MentionRow({
         actorType={item.type === "all" ? "member" : item.type}
         actorId={item.id}
         size={20}
+        showStatusDot
       />
       <span className="truncate font-medium">{item.label}</span>
       {item.type === "agent" && (
@@ -213,64 +334,107 @@ function MentionRow({
 // Suggestion config factory
 // ---------------------------------------------------------------------------
 
+function issueToMention(i: Pick<Issue, "id" | "identifier" | "title" | "status">): MentionItem {
+  return {
+    id: i.id,
+    label: i.identifier,
+    type: "issue" as const,
+    description: i.title,
+    status: i.status as IssueStatus,
+  };
+}
+
 export function createMentionSuggestion(qc: QueryClient): Omit<
   SuggestionOptions<MentionItem>,
   "editor"
 > {
-  return {
-    items: ({ query }) => {
-      const wsId = useWorkspaceStore.getState().workspace?.id;
-      const members: MemberWithUser[] = wsId ? qc.getQueryData(workspaceKeys.members(wsId)) ?? [] : [];
-      const agents: Agent[] = wsId ? qc.getQueryData(workspaceKeys.agents(wsId)) ?? [] : [];
-      const issues: Issue[] = wsId
-        ? qc.getQueryData<ListIssuesResponse>(issueKeys.list(wsId))?.issues ?? []
+  // Renderer/popup instances live in this closure so each ContentEditor owns
+  // its own TipTap suggestion popup lifecycle.
+  let renderer: ReactRenderer<MentionListRef> | null = null;
+  let popup: HTMLDivElement | null = null;
+
+  function buildSyncItems(query: string): MentionItem[] {
+    // Read workspace id imperatively because this runs in TipTap factory scope
+    // (outside React render). getCurrentWsId() is the non-React singleton set
+    // by the URL-driven workspace layout.
+    const wsId = getCurrentWsId();
+    if (!wsId) return [];
+
+    const members: MemberWithUser[] = qc.getQueryData(workspaceKeys.members(wsId)) ?? [];
+    const agents: Agent[] = qc.getQueryData(workspaceKeys.agents(wsId)) ?? [];
+    const cachedResponse = qc.getQueryData<ListIssuesCache>(issueKeys.list(wsId));
+    const cachedIssues: Issue[] = cachedResponse ? flattenIssueBuckets(cachedResponse) : [];
+
+    // Read current user identity imperatively — this factory runs outside
+    // React render so we can't useAuthStore() as a hook here. The Proxy in
+    // packages/core/auth/index.ts forwards `.getState()` to the registered
+    // store. Used to gate personal agents in the @mention list so members
+    // don't see (or auto-complete) agents they couldn't assign anyway.
+    const userId = useAuthStore.getState().user?.id ?? null;
+    const myRole =
+      members.find((m) => m.user_id === userId)?.role ?? null;
+
+    const q = query.toLowerCase();
+
+    const allItem: MentionItem[] =
+      "all members".includes(q) || "all".includes(q)
+        ? [{ id: "all", label: "All members", type: "all" as const }]
         : [];
 
-      const q = query.toLowerCase();
+    const memberItems: MentionItem[] = members
+      .filter((m) => m.name.toLowerCase().includes(q))
+      .map((m) => ({
+        id: m.user_id,
+        label: m.name,
+        type: "member" as const,
+      }));
 
-      // Show "All members" option when query is empty or matches "all"
-      const allItem: MentionItem[] =
-        "all members".includes(q) || "all".includes(q)
-          ? [{ id: "all", label: "All members", type: "all" as const }]
-          : [];
+    const agentItems: MentionItem[] = agents
+      .filter(
+        (a) =>
+          !a.archived_at &&
+          a.name.toLowerCase().includes(q) &&
+          canAssignAgentToIssue(a, { userId, role: myRole }).allowed,
+      )
+      .map((a) => ({ id: a.id, label: a.name, type: "agent" as const }));
 
-      const memberItems: MentionItem[] = members
-        .filter((m) => m.name.toLowerCase().includes(q))
-        .map((m) => ({
-          id: m.user_id,
-          label: m.name,
-          type: "member" as const,
-        }));
+    // Members and agents share a single ranked list — recently mentioned
+    // targets come first regardless of type, with an alphabetical fallback
+    // for everyone the user hasn't mentioned yet on this device.
+    const recency = getRecencyMap(wsId);
+    const userItems = sortUserItemsByRecency(
+      [...memberItems, ...agentItems],
+      recency,
+    );
 
-      const agentItems: MentionItem[] = agents
-        .filter((a) => !a.archived_at && a.name.toLowerCase().includes(q))
-        .map((a) => ({ id: a.id, label: a.name, type: "agent" as const }));
+    // Cached issues give an instant first paint; MentionList adds server
+    // matches for done/cancelled and any other issues not in this cache.
+    const issueItems: MentionItem[] = cachedIssues
+      .filter(
+        (i) =>
+          i.identifier.toLowerCase().includes(q) ||
+          i.title.toLowerCase().includes(q),
+      )
+      .map(issueToMention);
 
-      const issueItems: MentionItem[] = issues
-        .filter(
-          (i) =>
-            i.identifier.toLowerCase().includes(q) ||
-            i.title.toLowerCase().includes(q),
-        )
-        .map((i) => ({
-          id: i.id,
-          label: i.identifier,
-          type: "issue" as const,
-          description: i.title,
-          status: i.status as IssueStatus,
-        }));
+    return [...allItem, ...userItems, ...issueItems];
+  }
 
-      return [...allItem, ...memberItems, ...agentItems, ...issueItems].slice(0, 10);
+  return {
+    items: ({ query }) => {
+      const syncItems = buildSyncItems(query);
+      return syncItems;
     },
 
     render: () => {
-      let renderer: ReactRenderer<MentionListRef> | null = null;
-      let popup: HTMLDivElement | null = null;
-
       return {
         onStart: (props: SuggestionProps<MentionItem>) => {
           renderer = new ReactRenderer(MentionList, {
-            props: { items: props.items, command: props.command },
+            props: {
+              items: props.items,
+              query: props.query,
+              command: props.command,
+            },
             editor: props.editor,
           });
 
@@ -286,6 +450,7 @@ export function createMentionSuggestion(qc: QueryClient): Omit<
         onUpdate: (props: SuggestionProps<MentionItem>) => {
           renderer?.updateProps({
             items: props.items,
+            query: props.query,
             command: props.command,
           });
           if (popup) updatePosition(popup, props.clientRect);

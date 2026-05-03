@@ -1,5 +1,5 @@
 -- name: ListIssues :many
-SELECT id, workspace_id, title, status, priority,
+SELECT id, workspace_id, title, description, status, priority,
        assignee_type, assignee_id, creator_type, creator_id,
        parent_issue_id, position, due_date, created_at, updated_at, number, project_id
 FROM issue
@@ -57,11 +57,22 @@ UPDATE issue SET
 WHERE id = $1
 RETURNING *;
 
+-- name: CreateIssueWithOrigin :one
+INSERT INTO issue (
+    workspace_id, title, description, status, priority,
+    assignee_type, assignee_id, creator_type, creator_id,
+    parent_issue_id, position, due_date, number, project_id,
+    origin_type, origin_id
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+    sqlc.narg('origin_type'), sqlc.narg('origin_id')
+) RETURNING *;
+
 -- name: DeleteIssue :exec
 DELETE FROM issue WHERE id = $1;
 
 -- name: ListOpenIssues :many
-SELECT id, workspace_id, title, status, priority,
+SELECT id, workspace_id, title, description, status, priority,
        assignee_type, assignee_id, creator_type, creator_id,
        parent_issue_id, position, due_date, created_at, updated_at, number, project_id
 FROM issue
@@ -89,6 +100,18 @@ SELECT * FROM issue
 WHERE parent_issue_id = $1
 ORDER BY position ASC, created_at DESC;
 
+-- name: GetIssueByOrigin :one
+-- Finds the issue stamped with a specific (origin_type, origin_id) pair.
+-- Used by quick-create completion to deterministically locate the issue
+-- produced by a given agent_task_queue.id — robust against concurrent
+-- issue creates by the same agent (assignment task + quick-create both
+-- running with max_concurrent_tasks > 1).
+SELECT * FROM issue
+WHERE workspace_id = $1
+  AND origin_type = $2
+  AND origin_id = $3
+LIMIT 1;
+
 -- name: CountCreatedIssueAssignees :many
 -- Count assignees on issues created by a specific user.
 SELECT
@@ -113,3 +136,13 @@ WHERE workspace_id = $1
 GROUP BY parent_issue_id;
 
 -- SearchIssues: moved to handler (dynamic SQL for multi-word search support).
+
+-- name: MarkIssueFirstExecuted :one
+-- Flips first_executed_at from NULL to now() atomically. Returns the row if
+-- this was the first time the issue was executed; no rows otherwise. The
+-- analytics issue_executed event fires exactly when this returns a row —
+-- retries and re-assignments hit the WHERE clause and no-op.
+UPDATE issue
+SET first_executed_at = now()
+WHERE id = $1 AND first_executed_at IS NULL
+RETURNING id, workspace_id, creator_type, creator_id, first_executed_at;
