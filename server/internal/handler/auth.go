@@ -76,6 +76,13 @@ type LoginResponse struct {
 	User  UserResponse `json:"user"`
 }
 
+const (
+	trustedForwardAuthLoginEnv = "TRUSTED_FORWARD_AUTH_LOGIN"
+	forwardAuthEmailHeaderEnv  = "TRUSTED_FORWARD_AUTH_EMAIL_HEADER"
+	defaultForwardAuthEmail    = "Remote-Email"
+	loggedInCookieName         = "multica_logged_in"
+)
+
 type SendCodeRequest struct {
 	Email string `json:"email"`
 }
@@ -392,6 +399,110 @@ func (h *Handler) VerifyCode(w http.ResponseWriter, r *http.Request) {
 		Token: tokenString,
 		User:  userToResponse(user),
 	})
+}
+
+// ForwardAuthLogin exchanges trusted reverse-proxy identity headers for the
+// normal Multica browser auth cookies. It is disabled unless explicitly enabled
+// by self-hosted deployments that protect this route with forwardAuth.
+func (h *Handler) ForwardAuthLogin(w http.ResponseWriter, r *http.Request) {
+	if !trustedForwardAuthLoginEnabled() {
+		http.NotFound(w, r)
+		return
+	}
+
+	email := strings.ToLower(strings.TrimSpace(forwardAuthHeader(r, forwardAuthEmailHeaderEnv, defaultForwardAuthEmail)))
+	if email == "" || !strings.Contains(email, "@") {
+		writeError(w, http.StatusUnauthorized, "missing forwarded auth email")
+		return
+	}
+
+	user, isNew, err := h.findOrCreateUser(r.Context(), email)
+	if err != nil {
+		var signupErr SignupError
+		if errors.As(err, &signupErr) {
+			writeError(w, http.StatusForbidden, signupErr.Error())
+			return
+		}
+		slog.Warn("forward-auth login failed", append(logger.RequestAttrs(r), "error", err, "email", email)...)
+		writeError(w, http.StatusInternalServerError, "failed to create user")
+		return
+	}
+	if isNew {
+		evt := analytics.Signup(uuidToString(user.ID), user.Email, signupSourceFromRequest(r))
+		evt.Properties["auth_method"] = "forward_auth"
+		h.Analytics.Capture(evt)
+	}
+
+	tokenString, err := h.issueJWT(user)
+	if err != nil {
+		slog.Warn("forward-auth login failed", append(logger.RequestAttrs(r), "error", err, "email", email)...)
+		writeError(w, http.StatusInternalServerError, "failed to generate token")
+		return
+	}
+
+	if err := auth.SetAuthCookies(w, tokenString); err != nil {
+		slog.Warn("failed to set auth cookies", "error", err)
+	}
+	setLoggedInMarkerCookie(w, r)
+
+	if h.CFSigner != nil {
+		for _, cookie := range h.CFSigner.SignedCookies(time.Now().Add(30 * 24 * time.Hour)) {
+			http.SetCookie(w, cookie)
+		}
+	}
+
+	slog.Info("user logged in via forward auth", append(logger.RequestAttrs(r), "user_id", uuidToString(user.ID), "email", user.Email)...)
+	http.Redirect(w, r, sanitizeForwardAuthNext(r.URL.Query().Get("next")), http.StatusSeeOther)
+}
+
+func trustedForwardAuthLoginEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(trustedForwardAuthLoginEnv))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func forwardAuthHeader(r *http.Request, envName, defaultName string) string {
+	name := strings.TrimSpace(os.Getenv(envName))
+	if name == "" {
+		name = defaultName
+	}
+	return strings.TrimSpace(r.Header.Get(name))
+}
+
+func sanitizeForwardAuthNext(next string) string {
+	next = strings.TrimSpace(next)
+	if next == "" || !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") {
+		return "/"
+	}
+	return next
+}
+
+func setLoggedInMarkerCookie(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     loggedInCookieName,
+		Value:    "1",
+		Path:     "/",
+		MaxAge:   365 * 24 * 60 * 60,
+		Expires:  time.Now().Add(365 * 24 * time.Hour),
+		HttpOnly: false,
+		Secure:   isForwardAuthSecureRequest(r),
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+func isForwardAuthSecureRequest(r *http.Request) bool {
+	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		return true
+	}
+	if frontendOrigin := strings.TrimSpace(os.Getenv("FRONTEND_ORIGIN")); frontendOrigin != "" {
+		if u, err := url.Parse(frontendOrigin); err == nil && strings.EqualFold(u.Scheme, "https") {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Handler) GetMe(w http.ResponseWriter, r *http.Request) {

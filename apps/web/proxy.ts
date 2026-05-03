@@ -16,6 +16,15 @@ const LEGACY_ROUTE_SEGMENTS = new Set([
   "settings",
 ]);
 
+function forwardAuthLoginRedirect(req: NextRequest) {
+  const url = req.nextUrl.clone();
+  const next = `${req.nextUrl.pathname}${req.nextUrl.search}`;
+  url.pathname = "/auth/forward-auth-login";
+  url.search = "";
+  url.searchParams.set("next", next || "/");
+  return NextResponse.redirect(url);
+}
+
 // Next.js 16 renamed `middleware` → `proxy`. The runtime API is identical.
 export function proxy(req: NextRequest) {
   const { pathname } = req.nextUrl;
@@ -30,8 +39,7 @@ export function proxy(req: NextRequest) {
     const url = req.nextUrl.clone();
 
     if (!hasSession) {
-      url.pathname = "/login";
-      return NextResponse.redirect(url);
+      return forwardAuthLoginRedirect(req);
     }
 
     if (lastSlug) {
@@ -49,7 +57,7 @@ export function proxy(req: NextRequest) {
 
   // --- Root path: redirect logged-in users to their last workspace ---
   if (pathname === "/") {
-    if (!hasSession) return NextResponse.next();
+    if (!hasSession) return forwardAuthLoginRedirect(req);
 
     if (lastSlug) {
       const url = req.nextUrl.clone();
@@ -62,12 +70,17 @@ export function proxy(req: NextRequest) {
     return NextResponse.next();
   }
 
+  if (pathname === "/login" && !hasSession) {
+    return forwardAuthLoginRedirect(req);
+  }
+
   return NextResponse.next();
 }
 
 export const config = {
   matcher: [
     "/",
+    "/login",
     "/issues/:path*",
     "/projects/:path*",
     "/agents/:path*",
