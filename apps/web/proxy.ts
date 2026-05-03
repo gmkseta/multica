@@ -42,6 +42,17 @@ function nextWithLocale(req: NextRequest): NextResponse {
   return NextResponse.next({ request: { headers } });
 }
 
+// Homelab (fork): redirect unauthenticated users to the Authelia forward-auth
+// bridge, preserving the originally requested path in `next`.
+function forwardAuthLoginRedirect(req: NextRequest) {
+  const url = req.nextUrl.clone();
+  const next = `${req.nextUrl.pathname}${req.nextUrl.search}`;
+  url.pathname = "/auth/forward-auth-login";
+  url.search = "";
+  url.searchParams.set("next", next || "/");
+  return NextResponse.redirect(url);
+}
+
 // Next.js 16 renamed `middleware` → `proxy`. API surface (NextRequest /
 // NextResponse / cookies / matcher) is identical; the only behavioral
 // change is the runtime — proxy is forced to nodejs and cannot opt into
@@ -66,8 +77,7 @@ export function proxy(req: NextRequest) {
     const url = req.nextUrl.clone();
 
     if (!hasSession) {
-      url.pathname = "/login";
-      return NextResponse.redirect(url);
+      return forwardAuthLoginRedirect(req);
     }
 
     if (lastSlug) {
@@ -86,21 +96,34 @@ export function proxy(req: NextRequest) {
   // --- Root path: redirect logged-in users to their last workspace ---
   // The official cloud host also serves the public marketing site. Visiting
   // https://multica.ai/ must remain a public-site navigation even when a local
-  // desktop/runtime session has fresh auth cookies; explicit app routes such
-  // as /acme/issues and legacy /issues still route to the workspace app.
+  // desktop/runtime session has fresh auth cookies. Self-hosted hosts (e.g.
+  // task.*) are never the marketing host, so they fall through to the
+  // forward-auth / workspace flow below.
+  if (pathname === "/" && !isOfficialMarketingHost(req.nextUrl.hostname)) {
+    // Homelab (fork): bridge Authelia SSO → Multica session.
+    if (!hasSession) return forwardAuthLoginRedirect(req);
+
+    if (lastSlug) {
+      const url = req.nextUrl.clone();
+      url.pathname = `/${lastSlug}/issues`;
+      return NextResponse.redirect(url);
+    }
+    // Logged-in but no workspace cookie yet → forward locale + let the landing
+    // page pick the first workspace client-side.
+    return nextWithLocale(req);
+  }
+
+  // Homelab (fork): send unauthenticated /login through the SSO bridge.
   if (
-    pathname === "/" &&
-    hasSession &&
-    lastSlug &&
+    pathname === "/login" &&
+    !hasSession &&
     !isOfficialMarketingHost(req.nextUrl.hostname)
   ) {
-    const url = req.nextUrl.clone();
-    url.pathname = `/${lastSlug}/issues`;
-    return NextResponse.redirect(url);
+    return forwardAuthLoginRedirect(req);
   }
 
   // --- Default: forward locale header to RSC, no redirect/rewrite ---
-  // Covers logged-out root path, /login, /:slug/*, and everything else.
+  // Covers the marketing host root, /:slug/*, /docs, and everything else.
   return nextWithLocale(req);
 }
 
@@ -109,6 +132,10 @@ export const config = {
   // negative-lookahead pattern from Next's i18n guide, plus explicit runtime
   // proxy routes whose upstream origins are resolved from process.env at
   // request time instead of being baked into next.config.js at build time.
+  //
+  // Upstream's matcher already covers every fork route: the negative-lookahead
+  // catch-all matches "/", "/login", and all "/{slug}/*" app pages (locale
+  // header), while the explicit prefixes carry the runtime-proxy rewrites.
   matcher: [
     "/api/:path*",
     "/auth/:path*",
